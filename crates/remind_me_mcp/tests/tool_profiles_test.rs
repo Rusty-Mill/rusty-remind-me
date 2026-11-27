@@ -8,7 +8,9 @@
 #[path = "../../remind_me_core/src/test_env.rs"]
 mod test_env;
 
-use remind_me_core::tool_profiles::{ALIASES, CORE, GROUPS, TOOL_PROFILE_ENV, WIKI};
+use remind_me_core::clients::CLIENTS_FILE_ENV;
+use remind_me_core::sync::CLIENT_ENV;
+use remind_me_core::tool_profiles::{ALIASES, CORE, GROUPS, MINIMAL, TOOL_PROFILE_ENV, WIKI};
 use remind_me_core::Database;
 use remind_me_mcp::McpServer;
 use serde_json::{json, Value};
@@ -24,12 +26,38 @@ fn env_lock() -> MutexGuard<'static, ()> {
 /// Run `body` under `profile` (`None` = unset), restoring the env after.
 fn with_profile<T>(profile: Option<&str>, body: impl FnOnce() -> T) -> T {
     let _guard = env_lock();
+    no_registry();
     match profile {
         Some(p) => crate::test_env::set_var(TOOL_PROFILE_ENV, p),
         None => crate::test_env::remove_var(TOOL_PROFILE_ENV),
     }
     let out = body();
     crate::test_env::remove_var(TOOL_PROFILE_ENV);
+    out
+}
+
+/// Point the client registry at a missing file, so a real
+/// `~/.remind-me/clients.json` cannot change what these tests see.
+fn no_registry() {
+    let missing = std::env::temp_dir().join(format!("rrm_no_clients_{}.json", std::process::id()));
+    crate::test_env::set_var(CLIENTS_FILE_ENV, missing);
+}
+
+/// Run `body` as client `client` under registry `json`, with
+/// `REMIND_ME_TOOL_PROFILE` set to `env_profile`.
+fn as_registered<T>(json: &str, client: &str, env_profile: &str, body: impl FnOnce() -> T) -> T {
+    let _guard = env_lock();
+    let file =
+        std::env::temp_dir().join(format!("rrm_clients_{}_{client}.json", std::process::id()));
+    std::fs::write(&file, json).unwrap();
+    crate::test_env::set_var(CLIENTS_FILE_ENV, &file);
+    crate::test_env::set_var(CLIENT_ENV, client);
+    crate::test_env::set_var(TOOL_PROFILE_ENV, env_profile);
+    let out = body();
+    crate::test_env::remove_var(TOOL_PROFILE_ENV);
+    crate::test_env::remove_var(CLIENT_ENV);
+    no_registry();
+    let _ = std::fs::remove_file(&file);
     out
 }
 
@@ -275,4 +303,114 @@ fn only_the_capture_caller_reaches_the_capture_tool_under_core() {
             .collect();
         assert!(!names.iter().any(|n| n == CAPTURE_TOOL), "{names:?}");
     });
+}
+
+#[test]
+fn minimal_lists_exactly_five_tools_and_refuses_core_ones() {
+    let (tools, status, list, reminder) = with_profile(Some("minimal"), || {
+        let s = server();
+        (
+            names(&s),
+            call(&s, "remind_me_server_status", json!({})),
+            call(&s, "remind_me_list", json!({})),
+            call(&s, "remind_me_set_reminder", json!({})),
+        )
+    });
+    let mut expected: Vec<&str> = MINIMAL.to_vec();
+    expected.sort_by_key(|t| CORE.iter().position(|c| c == t));
+    assert_eq!(tools, expected);
+    assert_eq!(status["isError"], true);
+    let why = text(&status);
+    assert!(why.contains("'core' group"), "{why}");
+    assert!(
+        why.contains(&format!("{TOOL_PROFILE_ENV}=minimal,core")),
+        "{why}"
+    );
+    // An alias works exactly when the tool it merged into is in minimal.
+    assert_ne!(list["isError"], true, "{}", text(&list));
+    assert_eq!(reminder["isError"], true);
+}
+
+#[test]
+fn minimal_plus_a_group_adds_it_and_minimal_core_is_core() {
+    let with_wiki = with_profile(Some("minimal,wiki"), || names(&server()));
+    for tool in MINIMAL.iter().chain(WIKI.iter()) {
+        assert!(with_wiki.iter().any(|t| t == tool), "{tool} missing");
+    }
+    assert!(!with_wiki.iter().any(|t| t == "remind_me_server_status"));
+    assert_eq!(
+        with_profile(Some("minimal,core"), || names(&server())),
+        CORE
+    );
+    let standard = with_profile(Some("minimal,standard"), || names(&server()));
+    assert!(standard.iter().any(|t| t == "remind_me_server_status"));
+}
+
+const REGISTRY: &str = r#"{ "hermes-jarvis": { "profile": "minimal", "format": "markdown" } }"#;
+
+#[test]
+fn a_registered_profile_beats_the_env_and_its_refusal_names_the_registry() {
+    let (tools, refused) = as_registered(REGISTRY, "hermes-jarvis", "full", || {
+        let s = server();
+        (names(&s), call(&s, "remind_me_update", json!({})))
+    });
+    assert_eq!(tools.len(), MINIMAL.len(), "{tools:?}");
+    let why = text(&refused);
+    assert!(why.contains("clients.json"), "{why}");
+}
+
+#[test]
+fn an_unregistered_client_keeps_the_env_profile() {
+    let tools = as_registered(REGISTRY, "someone-else", "core", || names(&server()));
+    assert_eq!(tools, CORE);
+}
+
+#[test]
+fn a_registered_format_is_the_default_when_the_call_sends_none() {
+    let registry = r#"{ "json-bot": { "format": "json" } }"#;
+    let (implicit, explicit) = as_registered(registry, "json-bot", "core", || {
+        let s = server();
+        call(&s, "remind_me_add", json!({ "content": "a numbat fact" }));
+        (
+            call(&s, "remind_me_search", json!({ "query": "numbat" })),
+            call(
+                &s,
+                "remind_me_search",
+                json!({ "query": "numbat", "response_format": "markdown" }),
+            ),
+        )
+    });
+    // search's own default is Markdown; the registry says JSON for this client.
+    let parsed = |r: &Value| serde_json::from_str::<Value>(&text(r)).is_ok();
+    assert!(parsed(&implicit), "{}", text(&implicit));
+    assert!(!parsed(&explicit), "{}", text(&explicit));
+}
+
+#[test]
+fn a_registered_brief_budget_is_the_default_token_budget() {
+    let registry = r#"{ "brief-bot": { "brief_budget": 600 } }"#;
+    let (implicit, explicit) = as_registered(registry, "brief-bot", "core", || {
+        let s = server();
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "shipped the wombat parser", "tags": ["wombat"] }),
+        );
+        call(
+            &s,
+            "remind_me_entity",
+            json!({ "action": "upsert", "name": "wombat" }),
+        );
+        let brief = |extra: Value| {
+            let mut args = json!({ "project": "wombat", "response_format": "json" });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let out = call(&s, "remind_me_brief", args);
+            serde_json::from_str::<Value>(&text(&out)).unwrap_or_else(|_| json!(text(&out)))
+        };
+        (brief(json!({})), brief(json!({ "token_budget": 900 })))
+    });
+    assert_eq!(implicit["budget"]["limit"], json!(600), "{implicit}");
+    assert_eq!(explicit["budget"]["limit"], json!(900), "{explicit}");
 }

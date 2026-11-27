@@ -85,23 +85,44 @@ fn decode<T: Wire>(value: &Value, what: &str) -> Result<T, ErrorData> {
 /// The handler's tools, asked for on every list and call.
 struct Tools(Arc<dyn Handler>);
 
+/// The caller this call's context names, as the `_meta` value the handler
+/// reads under [`CALLER_META_KEY`].
+fn caller_of(ctx: &CallContext) -> Option<String> {
+    ctx.client_info()
+        .and_then(|info| remind_me_mcp::identity(&info.name, Some(&info.version)))
+}
+
+/// The tools `tools/list` answers under `params`, decoded; an empty list
+/// when the listing cannot be had.
+fn listed_tools(mcp: &dyn Handler, params: Value) -> Vec<Tool> {
+    // A list that cannot be had is an empty list here; the client sees no
+    // tools rather than an error it could not act on.
+    let Ok(result) = ask(mcp, "tools/list", params) else {
+        return Vec::new();
+    };
+    result
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| decode::<Tool>(t, "tool").ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl ToolSource for Tools {
     fn tools(&self) -> Vec<Tool> {
-        // A list that cannot be had is an empty list here; the client sees no
-        // tools rather than an error it could not act on.
-        let Ok(result) = ask(self.0.as_ref(), "tools/list", json!({})) else {
-            return Vec::new();
-        };
-        result
-            .get("tools")
-            .and_then(Value::as_array)
-            .map(|tools| {
-                tools
-                    .iter()
-                    .filter_map(|t| decode::<Tool>(t, "tool").ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+        listed_tools(self.0.as_ref(), json!({}))
+    }
+
+    /// Listed per caller, like a call: the caller's registered profile
+    /// decides what it sees (ADR-0028 §2, D113), so the list matches what a
+    /// call would be allowed.
+    fn tools_for(&self, ctx: &CallContext) -> Result<Vec<Tool>, ErrorData> {
+        let params = json!({ "_meta": { CALLER_META_KEY: caller_of(ctx) } });
+        Ok(listed_tools(self.0.as_ref(), params))
     }
 
     /// The call names its caller: one remote server serves every connected
@@ -119,9 +140,7 @@ impl ToolSource for Tools {
             .as_ref()
             .and_then(|a| serde_json::from_str::<Value>(&a.to_json_string()).ok())
             .unwrap_or_else(|| json!({}));
-        let caller = ctx
-            .client_info()
-            .and_then(|info| remind_me_mcp::identity(&info.name, Some(&info.version)));
+        let caller = caller_of(ctx);
         let params = json!({
             "name": call.name,
             "arguments": arguments,

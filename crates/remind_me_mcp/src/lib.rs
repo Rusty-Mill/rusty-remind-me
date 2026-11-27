@@ -126,7 +126,13 @@ fn requested_format(args: &serde_json::Value) -> ResponseFormat {
 }
 
 /// The configured fallback for the [`requested_format`] population.
+///
+/// The client registry's `format` for the resolved caller wins (ADR-0028 §2,
+/// per caller), then [`DEFAULT_FORMAT_ENV`].
 fn configured_default_format() -> ResponseFormat {
+    if let Some(format) = remind_me_core::clients::current_entry().and_then(|e| e.format) {
+        return format;
+    }
     // Per session: on the daemon, each client keeps its own default.
     default_format_from(remind_me_core::daemon::session::var(DEFAULT_FORMAT_ENV).as_deref())
 }
@@ -698,952 +704,7 @@ impl McpServer {
             }
             "tools/list" => {
                 let req_id = id.unwrap_or(json!(1));
-                let mut listed = json!({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "tools": [
-                            {
-                                "name": "remind_me_add",
-                                "description": "Save a fact, decision, preference or note to remind-me memory; call this whenever the user states something durable. A decision needs metadata.rationale. Saving a decision checks it against the standing, non-sensitive decisions in the same project on the same claim or a shared entity and returns likely conflicts as contradiction_candidates. Any memory returns likely near-duplicates in its project as duplicate_candidates. Nothing is blocked or superseded automatically. Pass supersedes to retire the old decision in the same call. When the event happened at another time than now, set metadata.occurred_at (RFC 3339, or {from, to}), resolving relative dates to absolute ones.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
-                                        "content": { "type": "string" },
-                                        "category": { "type": "string", "default": "general" },
-                                        "tags": { "type": "array", "items": { "type": "string" } },
-                                        "source": { "type": "string", "default": "manual" },
-                                        "sensitive": { "type": "boolean", "default": false, "description": "Mark this memory sensitive: kept out of ordinary search and list results unless include_sensitive is set. A convenience flag, NOT access control — this is a single-user store and anyone with the database reads everything regardless." },
-                                        "extract": { "type": "boolean", "default": true, "description": "Extract references (issues, commits, URLs, paths, handles) and entities from the content. REMIND_ME_EXTRACT=0 disables it globally." },
-                                        "attachments": {
-                                            "type": "array",
-                                            "description": "Files or URLs this memory points at. A path is hashed (sha256) and only the fingerprint, size and mime type are stored, never the bytes.",
-                                            "items": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "path": { "type": "string" },
-                                                    "url": { "type": "string" },
-                                                    "label": { "type": "string" }
-                                                }
-                                            }
-                                        },
-                                        "project": { "type": "string", "maxLength": 200, "description": "The project this memory belongs to, e.g. a registered project name. Replaces the project detected from the writer's directory; blank is unset." },
-                                        "metadata": { "type": "object", "description": "Free-form JSON stored with the memory; a decision requires a `rationale` string here, an action_item may hold due, owner and status. occurred_at: when the event happened, RFC 3339 or {from, to}." },
-                                        "subject": { "type": "string", "description": "Subject of a subject-predicate-object fact. remind_me_add does not supersede a live triple with the same subject and predicate; name it in supersedes to do so." },
-                                        "predicate": { "type": "string", "description": "Predicate of the fact triple." },
-                                        "object": { "type": "string", "description": "Object of the fact triple." },
-                                        "entities": {
-                                            "type": "array",
-                                            "description": "Entities this memory mentions, linked into the knowledge graph.",
-                                            "items": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "name": { "type": "string" },
-                                                    "kind": { "type": "string" },
-                                                    "aliases": { "type": "array", "items": { "type": "string" } }
-                                                },
-                                                "required": ["name"]
-                                            }
-                                        },
-                                        "memory_type": { "type": "string", "enum": ["decision", "action_item", "preference", "fact", "reference", "insight", "learning", "blocker", "work_log", "unclassified"], "description": "What kind of memory this is; a decision requires metadata.rationale." },
-                                        "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 1, "description": "How far to trust this memory; scales its search ranking." },
-                                        "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold; omit for always." },
-                                        "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
-                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded", "carded"], "description": "Only for decision and action_item memories; prefer remind_me_resolve for an existing one." },
-                                        "supersedes": { "type": "array", "items": { "type": "string" }, "description": "IDs of live memories this one replaces, e.g. a contradiction_candidates id. Each is marked superseded by the new memory, in one transaction with the add; an id that is missing, deleted, already superseded or a project claim refuses the whole add." }
-                                    },
-                                    "required": ["content"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_get",
-                                "description": "Get memories by ID: one with memory_id, or several with memory_ids (e.g. the ids a compact remind_me_search returned or trimmed). memory_ids returns {memories, missing}.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "memory_id": { "type": "string" },
-                                        "memory_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": GET_IDS_MAX, "description": "Fetch several memories in one call. Use instead of memory_id, not with it." },
-                                        "id": { "type": "string", "description": "Deprecated alias for memory_id. Prefer memory_id; kept for backward compatibility." }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_list",
-                                "description": "List memories with optional filtering by category, tags, or source. Results are paginated, newest first.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown", "description": "markdown (default, as the reference) renders the memories; json returns the structured page." },
-                                        "category": { "type": "string" },
-                                        "tags": {
-                                            "type": "array",
-                                            "items": { "type": "string" },
-                                            "description": "Memory must have ALL of these tags"
-                                        },
-                                        "source": { "type": "string" },
-                                        "project": { "type": "string", "description": "Only memories written in this project (case-insensitive)" },
-                                        "project_status": { "type": "string", "enum": ["active", "dormant", "abandoned"], "description": "Only memories whose project is a registered project (remind_me_project, by name or alias) with this status" },
-                                        "branch": { "type": "string", "description": "Only memories written on this git branch" },
-                                        "session_id": { "type": "string", "description": "Only memories written in this client session" },
-                                        "written_by": { "type": "string", "description": "Only memories by this writer: human, hook, model, model:<id> or importer:<name>" },
-                                        "limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
-                                        "offset": { "type": "integer", "default": 0, "minimum": 0 },
-                                        "include_sensitive": { "type": "boolean", "default": false, "description": "Include memories marked sensitive. Off by default, so sensitive content never surfaces in an ordinary request." }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_update",
-                                "description": "Update an existing memory's content, category, tags, or metadata. A content or type change that leaves a decision returns likely conflicting standing decisions as contradiction_candidates.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
-                                        "memory_id": { "type": "string" },
-                                        "content": { "type": "string" },
-                                        "category": { "type": "string" },
-                                        "tags": { "type": "array", "items": { "type": "string" } },
-                                        "metadata": { "type": "object" },
-                                        "sensitive": { "type": "boolean", "description": "Set or clear the sensitive flag. Omit to leave it unchanged." },
-                                        "clear_superseded": { "type": "boolean", "default": false, "description": "Clear this memory's superseded_by flag, un-hiding it from search, entity, and subject/predicate lookups. Recovery path for a false-positive contradiction-supersession. Does not affect the memory that did the superseding." },
-                                        "memory_type": { "type": "string", "enum": ["decision", "action_item", "preference", "fact", "reference", "insight", "learning", "blocker", "work_log", "unclassified"], "description": "Reclassify; a decision requires metadata.rationale (in this call or already stored)." },
-                                        "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "How far to trust this memory; scales its search ranking." },
-                                        "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold." },
-                                        "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
-                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded", "carded"], "description": "Only for decision and action_item memories." },
-                                        "project": { "type": "string", "description": "Set the memory's project (trimmed, one line, at most 200 bytes). Omit or leave blank to keep it; it cannot be cleared." }
-                                    },
-                                    "required": ["memory_id"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_delete",
-                                "description": "Delete one remind-me memory by id, when the user asks to forget it or it is wrong.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "memory_id": { "type": "string" }
-                                    },
-                                    "required": ["memory_id"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_search",
-                                "description": "Search memories using FTS5 keyword & hybrid ranking. tags, entity, topic, repo and the project/branch/session/writer filters narrow the ranked results before the limit applies. Returns compact hits by default (id, category, date, tags, score, snippet); fetch full text with remind_me_get memory_ids, or pass detail=full. Hits cut by token_budget are listed by id. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown", "description": "markdown (default, as the reference) renders the results; json returns the full envelope including scores." },
-                                        "query": { "type": "string", "description": "Search text. May be empty when since or until is set, to list that window newest-first. When the server sets REMIND_ME_DATE_PHRASES=on and no since/until is given, a relative date phrase in it (yesterday, last week, past 3 days, since monday) becomes the window and leaves the text; the response's inferred_window says so." },
-                                        "limit": { "type": "integer", "default": 20 },
-                                        "detail": { "type": "string", "enum": ["compact", "full"], "default": "compact", "description": "compact (default): one short line per hit, so more hits fit the budget. full: whole memories with metadata and references." },
-                                        "token_budget": { "type": "integer", "default": 800, "minimum": 0, "description": "Estimated tokens the hits may use; 0 is unlimited. Hits that do not fit are listed by id." },
-                                        "category": { "type": "string" },
-                                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Only memories carrying these tags (see tag_mode)" },
-                                        "tag_mode": { "type": "string", "enum": ["all", "any"], "default": "all", "description": "all: every tag must be present; any: at least one" },
-                                        "entity": { "type": "string", "description": "Only memories about this entity, by name or alias: linked to it, or naming it as subject or object. An unknown entity matches nothing." },
-                                        "topic": { "type": "string", "description": "Only memories in this topic or any topic below it, e.g. Systems Engineering. An unknown topic matches nothing." },
-                                        "repo": { "type": "string", "description": "Only memories written in this git repository (origin remote, any URL form, e.g. github.com/owner/repo)" },
-                                        "project": { "type": "string", "description": "Only memories written in this project (case-insensitive)" },
-                                        "project_status": { "type": "string", "enum": ["active", "dormant", "abandoned"], "description": "Only memories whose project is a registered project (remind_me_project, by name or alias) with this status" },
-                                        "branch": { "type": "string", "description": "Only memories written on this git branch" },
-                                        "session_id": { "type": "string", "description": "Only memories written in this client session" },
-                                        "written_by": { "type": "string", "description": "Only memories by this writer: human, hook, model, model:<id> or importer:<name>" },
-                                        "include_dormant": { "type": "boolean", "default": false, "description": "Include memories that have decayed below the vitality floor" },
-                                        "min_vitality": { "type": "number", "default": 0, "description": "Only return memories at or above this current vitality" },
-                                        "expand_entities": { "type": "boolean", "default": false, "description": "Also surface memories mentioning the same entities" },
-                                        "include_neighbors": { "type": "boolean", "default": false, "description": "Also surface adjacent chunks of the same source document" },
-                                        "expand_co_retrieval": { "type": "boolean", "default": false, "description": "Also surface memories frequently retrieved alongside these" },
-                                        "include_sensitive": { "type": "boolean", "default": false, "description": "Include memories marked sensitive. Off by default, so sensitive content never surfaces in an ordinary request." },
-                                        "bootstrap": { "type": "boolean", "default": false, "description": "Prepend the durable persona (L3) as context, whether or not it matches the query. Spends up to a quarter of token_budget; the rest still goes to the ranked results." },
-                                        "include_expired": { "type": "boolean", "default": true, "description": "Include memories whose valid_until has passed. They always rank after in-window ones; set false to drop them." },
-                                        "min_confidence": { "type": "number", "default": 0, "description": "Only return memories at or above this confidence (0 to 1)." },
-                                        "include_raw": { "type": "boolean", "default": false, "description": "Rank raw session dialogs and skeletons too. Off by default: facts and summaries rank, and each carries the capture_id of its dialog. A dialog category or a session_id filter turns it on, and when nothing refined matches the best dialogs come back marked as raw." },
-                                        "since": { "type": "string", "description": "Only memories at or after this time (inclusive): RFC 3339, an age back from now like 30m, 12h, 2d, 1w, or a date phrase like yesterday, last week, past 3 days, since monday, in march, Q3, 2026-10 or 2026-01 to 2026-03. A phrase naming a whole period (yesterday, last week, Q3) also ends the window at that period's end unless until is given. Phrases use the server's REMIND_ME_TZ calendar (UTC if unset)." },
-                                        "until": { "type": "string", "description": "Only memories before this time (exclusive): RFC 3339, an age back from now like 30m, 12h, 2d, 1w, or a date phrase naming a period, which ends the window at that period's end (today, last month, Q3). Must be after since." },
-                                        "time_field": { "type": "string", "enum": ["created", "updated", "occurred"], "default": "created", "description": "Which timestamp since/until apply to. occurred: metadata.occurred_at, else created; a {from, to} span counts when it overlaps the window." },
-                                        "strategy": { "type": "string", "enum": ["auto", "balanced", "keyword_favored", "semantic_favored"], "default": "auto", "description": "RRF weight profile. Leave at auto (routes by query shape: quoted phrases, prefix* wildcards and very short queries favour keyword relevance; long or question-shaped queries favour semantic similarity) unless deliberately A/B testing a pinned preset." }
-                                    },
-                                    "required": ["query"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_brief",
-                                "description": "Get a remind-me brief for one project: current state, open blockers, decisions and action items, and recent activity, with ids for remind_me_get.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "additionalProperties": false,
-                                    "properties": {
-                                        "project": { "type": "string", "description": "Project or entity name, or an alias" },
-                                        "since": { "type": "string", "default": context_brief::DEFAULT_SINCE, "description": "Activity window start: 7d, 12h, an RFC 3339 time or a date phrase such as yesterday or last week (its start), at most 365 days back" },
-                                        "token_budget": { "type": "integer", "default": context_brief::DEFAULT_TOKEN_BUDGET, "minimum": context_brief::MIN_TOKEN_BUDGET, "maximum": context_brief::MAX_TOKEN_BUDGET },
-                                        "response_format": { "type": "string", "enum": ["json", "markdown"] }
-                                    },
-                                    "required": ["project"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_entity",
-                                "description": "Look up everything remind-me knows about ONE named thing: a person, project, tool, org or place. Read-only: returns the entity record, its facts, the memories mentioning it and any possible_duplicates (likely the same thing under another spelling; never merged), or found=false for an unknown name. Use remind_me_search for topic questions or anything you cannot name exactly.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "name": { "type": "string", "description": "Entity name or alias, resolved case- and whitespace-insensitively" },
-                                        "limit": { "type": "integer", "default": 20, "minimum": ENTITY_LOOKUP_LIMIT_MIN, "maximum": ENTITY_LOOKUP_LIMIT_MAX, "description": "Maximum facts and maximum linked memories to return" }
-                                    },
-                                    "required": ["name"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_project",
-                                "description": remind_me_core::project_tool::DESCRIPTION,
-                                "inputSchema": remind_me_core::project_tool::input_schema()
-                            },
-                            {
-                                "name": "remind_me_entity_upsert",
-                                "description": "remind-me pipeline: create a knowledge-graph entity, or update its kind. remind_me_entity is read-only, so writing is a separate, explicit call. The answer lists possible_duplicates when the name likely matches an existing entity (rusty_mux vs rusty-mux); nothing is merged. Adding one name as an alias of the other marks a pair reviewed.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "name": { "type": "string" },
-                                        "kind": { "type": "string" },
-                                        "aliases": { "type": "array", "items": { "type": "string" } }
-                                    },
-                                    "required": ["name"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_import_chat",
-                                "description": "Import a chat export or document file into memory. .json/.jsonl are chat exports; .md/.markdown/.txt are content-sniffed in auto mode — chat role markers import as chat, everything else as a document chunked per section. Deduplicates by file content hash. The path must be inside the allowed import roots.",
-                                "inputSchema": import_input_schema(false)
-                            },
-                            {
-                                "name": "remind_me_import_directory",
-                                "description": "Import every supported file in a directory. Same parsing and per-file dedup as remind_me_import_chat.",
-                                "inputSchema": import_input_schema(true)
-                            },
-                            {
-                                "name": "remind_me_import_dbs",
-                                "description": "Bulk-import a daily-backup-system (dbs) archive. Reads its items/sources tables directly, read-only, and turns each live item into a memory with dbs's source and tags preserved as knowledge-graph entities rather than flattened into prose. Reruns are safe: unchanged items are skipped, and an item edited since its last import gets a fresh memory that supersedes the old one. Page a large archive with offset until has_more is false.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "db_path": { "type": "string", "description": "Path to the dbs SQLite archive, inside the allowed import roots" },
-                                        "source": { "type": "string", "description": "Restrict to one dbs source name (e.g. 'raindrop'). Omit for all." },
-                                        "item_type": { "type": "string", "description": "Restrict to one dbs item_kind (e.g. 'link'). Omit for all." },
-                                        "limit": {
-                                            "type": "integer",
-                                            "minimum": DBS_IMPORT_LIMIT_MIN,
-                                            "maximum": DBS_IMPORT_LIMIT_MAX,
-                                            "default": 500
-                                        },
-                                        "offset": { "type": "integer", "minimum": 0, "default": 0 },
-                                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Extra tags added to every imported memory" },
-                                        "dry_run": { "type": "boolean", "default": false, "description": "Report what would be imported without writing" }
-                                    },
-                                    "required": ["db_path"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_import_mempalace",
-                                "description": "Bulk-import memories from a MemPalace ChromaDB store, one page at a time. Reads its metadata segment directly, read-only, rather than one drawer at a time via MemPalace's own tools. A drawer carrying remind_me's own memory frontmatter has its category/tags/created restored; everything else is stored as one opaque memory per drawer, tagged with its wing and room. Already-imported drawers are skipped (tracked by drawer id), so reruns are safe. Reads REMIND_ME_MEMPALACE_PATH for the store location.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "wing": { "type": "string", "description": "Restrict to one wing (project). Omit for all." },
-                                        "room": { "type": "string", "description": "Restrict to one room within the wing. Omit for all." },
-                                        "limit": {
-                                            "type": "integer",
-                                            "minimum": MEMPALACE_IMPORT_LIMIT_MIN,
-                                            "maximum": MEMPALACE_IMPORT_LIMIT_MAX,
-                                            "default": 500
-                                        },
-                                        "offset": { "type": "integer", "minimum": 0, "default": 0 },
-                                        "category": { "type": "string", "description": "Category for a drawer with no restorable frontmatter category (default: mempalace_import)" },
-                                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Extra tags added to every imported memory" },
-                                        "dry_run": { "type": "boolean", "default": false, "description": "Report what would be imported without writing" }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_watch_status",
-                                "description": "Report the folder watcher: which directories are watched, which were refused for sitting outside the import roots, scan counts, and recent errors. Says what to configure when nothing is.",
-                                "inputSchema": { "type": "object", "properties": {} }
-                            },
-                            {
-                                "name": "remind_me_check_update",
-                                "description": "Check whether this checkout is behind origin/main. Read-only: fetches from the remote and compares commits, never modifies anything.",
-                                "inputSchema": { "type": "object", "properties": { "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." } } }
-                            },
-                            {
-                                "name": "remind_me_revoke_clients",
-                                "description": "remind-me admin: list OAuth clients registered with the remote connector's authorization server (FT-07), or revoke one by client_id. Without client_id, lists every registered client with its live access/refresh token counts -- this is the read path, not a bulk-revoke shorthand: there is no 'revoke all' operation, only 'list' (empty client_id) and 'revoke this one client' (client_id set). With client_id, deletes that client's registration and every token it holds; the live remote server re-reads the state file on each token check, so the client is locked out immediately and must re-register and re-obtain the owner's consent to reconnect.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "client_id": { "type": "string", "default": "", "description": "The client to revoke. Empty (default) lists clients instead of revoking anything." }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_reindex",
-                                "description": "remind-me admin: rebuild vector embeddings for every memory that doesn't have one yet. Existing embeddings are preserved; only missing ones are generated. Run this after configuring REMIND_ME_EMBEDDING_BACKEND, or after a bulk import that ran before an embedder was available. Reports 'degraded' when no embedder is configured or reachable, rather than silently doing nothing.",
-                                "inputSchema": { "type": "object", "properties": { "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." } } }
-                            },
-                            {
-                                "name": "remind_me_webhook_status",
-                                "description": "Report the push ingestion endpoint: whether a secret is configured, whether it is listening, where, and how many pushes it has ingested, skipped or refused. Distinguishes 'nobody configured one' from 'configured but the port could not be bound'.",
-                                "inputSchema": { "type": "object", "properties": {} }
-                            },
-                            {
-                                "name": "remind_me_list_connectors",
-                                "description": "List every registered import connector — the pluggable parsers behind remind_me_import_chat's `kind` parameter.",
-                                "inputSchema": { "type": "object", "properties": {} }
-                            },
-                            {
-                                "name": "remind_me_server_status",
-                                "description": "Report where the data lives and what is running: database path and size, schema version against what this build expects, memory count, backup inventory, and which subsystems are active. Subsystems this crate does not implement are named with a reason rather than reported as stopped.",
-                                "inputSchema": { "type": "object", "properties": { "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." } } }
-                            },
-                            {
-                                "name": "remind_me_export_memories",
-                                "description": "remind-me admin: export live memories to JSON or JSONL — every column, plus the entity graph. Deleted and superseded memories are excluded unless include_deleted is set, so an export is safe to re-import. Embedding vectors are excluded as derived data. Writes to file_path when given (must be inside the allowed export roots), otherwise returns the payload inline. With template \"decisions\" and a project it instead renders that project's decision memories as a deterministic markdown decisions log (superseded ones only with include_deleted).",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "format": { "type": "string", "enum": ["json", "jsonl"], "default": "json" },
-                                        "category": { "type": "string", "description": "Filter: only export memories with this category" },
-                                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Filter: memory must have ALL of these tags" },
-                                        "file_path": { "type": "string", "description": "Destination file, inside the allowed export roots. Omit to return inline." },
-                                        "include_graph": { "type": "boolean", "default": true, "description": "Append entities, links and relations as record_type-tagged records" },
-                                        "include_deleted": { "type": "boolean", "default": false, "description": "Include soft-deleted and superseded memories. Off by default: exported records are read back as live content, so re-importing an export that carried them would resurrect deleted and stale memories. Set only for a genuine full-backup or audit export, not for moving memories between machines." },
-                                        "template": { "type": "string", "enum": ["decisions"], "description": "Render through a template instead of exporting records. decisions: the project's decision memories as a markdown log. format, category, tags and include_graph do not apply." },
-                                        "project": { "type": "string", "description": "Project the template covers; required with template." }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_decompose",
-                                "description": "remind-me pipeline: break a captured conversation into individually searchable atomic facts, each linked to the capture. Write 2-5 per conversation, each self-contained for a reader with no other context: who, what, when and why, with relative dates resolved to absolute ones (2026-10-03, not 'last Friday'). Set metadata.basis: stated if someone said it, inferred if you concluded it (list the memory ids it rests on in metadata.premises). Set metadata.occurred_at (RFC 3339, or {from, to}) when the fact's event happened at another time than now. A fact whose subject/predicate match an existing fact but whose object differs supersedes it.",
-                                "inputSchema": decompose_input_schema()
-                            },
-                            {
-                                "name": "remind_me_decompose_batch",
-                                "description": "Fetch captures that have not been decomposed into atomic facts yet.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "batch_size": { "type": "integer", "default": 20, "minimum": DECOMPOSE_BATCH_MIN, "maximum": DECOMPOSE_BATCH_MAX },
-                                        "idle_minutes": { "type": "integer", "default": 0, "minimum": 0, "maximum": u32::MAX, "description": "Only captures unchanged for at least this many minutes, so a scheduled pass leaves a live session until it settles" }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_extract_batch",
-                                "description": "Fetch memories that have no structured triple and no entity mentions yet, so they can be annotated with remind_me_annotate. Raw captured dialogs are excluded — their facts come out through remind_me_decompose instead.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "batch_size": { "type": "integer", "default": 20, "minimum": EXTRACT_BATCH_MIN, "maximum": EXTRACT_BATCH_MAX }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_auto_capture",
-                                "description": "Save a whole conversation to remind-me as two linked memories, the verbatim dialog and a concise summary; call this at the end of any substantive conversation. Write the summary to stand alone: who decided or learned what, when (absolute dates, never 'today' or 'yesterday') and why. They share a capture_id, which remind_me_get retrieves both by and remind_me_decompose breaks into atomic facts. When the conversation is about an event at another time than now, set metadata.occurred_at (RFC 3339, or {from, to}), resolving relative dates to absolute ones.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
-                                        "conversation": { "type": "string", "minLength": 1, "maxLength": 500000, "description": "The verbatim exchange" },
-                                        "summary": { "type": "string", "minLength": 1, "maxLength": 50000, "description": "A concise, self-contained distillation: decisions, facts and action items with absolute dates" },
-                                        "title": { "type": "string", "maxLength": 200, "description": "Defaults to the summary's first line" },
-                                        "tags": { "type": "array", "items": { "type": "string" }, "maxItems": 20 },
-                                        "category": { "type": "string", "default": "conversation", "maxLength": 100, "description": "Category for the SUMMARY; the dialog is always stored as 'dialog'" },
-                                        "metadata": { "type": "object" },
-                                        "project": { "type": "string", "maxLength": 200, "description": "The project both memories belong to, e.g. a registered project name. Replaces the project detected from the writer's directory; blank is unset." }
-                                    },
-                                    "required": ["conversation", "summary"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_capture_transcript",
-                                "description": "remind-me import: store or refresh a Claude Code session's capture from its raw JSONL transcript: one dialog and summary pair per session_id, replaced in place on every call. For hooks on machines without the CLI (cloud sessions); a model should use remind_me_auto_capture. The raw transcript is also archived when REMIND_ME_ARCHIVE_DIR is set.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "session_id": { "type": "string", "minLength": 1, "maxLength": 200 },
-                                        "transcript": { "type": "string", "minLength": 1, "description": "The session's JSONL transcript so far, at most 3145728 bytes once JSON-escaped (each quote, backslash and newline counts twice); a caller over the limit sends its tail, cut at a line" },
-                                        "reason": { "type": "string", "enum": ["stop", "precompact", "end"] },
-                                        "project": { "type": "string", "maxLength": 200 },
-                                        "git_remote": { "type": "string", "maxLength": 500 },
-                                        "git_branch": { "type": "string", "maxLength": 200 },
-                                        "git_sha": { "type": "string", "maxLength": 64 },
-                                        "cwd": { "type": "string", "maxLength": 1000, "description": "Recorded as given; never read on this machine" }
-                                    },
-                                    "required": ["session_id", "transcript"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_get_capture",
-                                "description": "Retrieve a linked dialog and summary pair by their shared capture_id.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "capture_id": { "type": "string" }
-                                    },
-                                    "required": ["capture_id"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_archive_prune",
-                                "description": "remind-me admin: enforce the raw-transcript archive's retention limits (REMIND_ME_ARCHIVE_MAX_AGE_DAYS, REMIND_ME_ARCHIVE_MAX_BYTES), removing oldest-first. Runs automatically after each archived import; call it directly to reclaim space now or, with dry_run, to see what would go. Removes archives only — the memories derived from them are untouched.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "dry_run": { "type": "boolean", "default": true, "description": "Report what would be removed without removing it. Defaults to true — deletion is opt-in." }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_promotion_candidates",
-                                "description": "List what is ready to move up a rung of the refinement ladder (capture -> fact -> scenario -> persona). Each entry names the source memories, a snippet, and why it qualifies. Already-promoted sources are excluded, so re-running after promoting returns a shorter list rather than the same one. Stale scenarios and persona statements come first as `refresh` candidates with refresh_of and new_evidence.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "rung": { "type": "string", "enum": ["capture_to_fact", "fact_to_scenario", "scenario_to_persona"], "description": "capture_to_fact is reported here but promoted with remind_me_decompose." },
-                                        "limit": { "type": "integer", "default": PROMOTION_LIMIT_DEFAULT, "minimum": PROMOTION_LIMIT_MIN, "maximum": PROMOTION_LIMIT_MAX }
-                                    },
-                                    "required": ["rung"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_promote",
-                                "description": "remind-me pipeline: store a distillation of some memories as the rung above them, recording what it was built from. Provenance is mandatory: a promoted artifact with no sources could never be checked or demoted. Refuses capture_to_fact — that is remind_me_decompose — and refuses a sensitive source for a persona.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "rung": { "type": "string", "enum": ["fact_to_scenario", "scenario_to_persona"] },
-                                        "source_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The memories this was distilled from" },
-                                        "content": { "type": "string", "minLength": 1, "maxLength": 50000, "description": "The distillation" },
-                                        "refreshes": { "type": "string", "description": "A refresh candidate's refresh_of: the stale promoted memory this replaces, superseded in the same write" }
-                                    },
-                                    "required": ["rung", "source_ids", "content"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_stale_candidates",
-                                "description": "List memories worth re-checking: those whose content names a file (inside REMIND_ME_CODE_ROOTS) that has since changed or been deleted, and those whose valid_until has passed (reason `expired`, shown as expired_at). Read-only and never touches the memory it reports: a changed file does not prove the memory wrong, it only means the claim is worth re-checking. The file check is off -- only expired memories are listed -- unless REMIND_ME_CODE_ROOTS is configured.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "limit": { "type": "integer", "default": STALE_CANDIDATES_LIMIT_DEFAULT, "minimum": STALE_CANDIDATES_LIMIT_MIN, "maximum": STALE_CANDIDATES_LIMIT_MAX }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_persona",
-                                "description": "remind-me pipeline: the current persona: durable statements about the user whose grounds still hold. A statement whose sources have all been superseded or deleted is withheld automatically, so a contradicted fact demotes what was built on it. Set include_demoted to also see what is currently withheld and why. A statement with newer related memories says stale, with new_evidence.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "include_demoted": { "type": "boolean", "default": false, "description": "Also list statements currently withheld for lost provenance." }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_provenance",
-                                "description": "remind-me pipeline: what a memory was distilled from, and what was distilled from it. Walks the refinement ladder in both directions from one memory id.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "memory_id": { "type": "string" }
-                                    },
-                                    "required": ["memory_id"]
-                                }
-                            },
-                            references::tool_schema(),
-                            {
-                                "name": "remind_me_session_timeline",
-                                "description": "remind-me extras: a client session as an episode. With session_id: the session's start and end, branch and shas, then every memory written under it (captures, facts, the work log) oldest first. Without: the most recent sessions, newest first, each with how many memories it wrote.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "session_id": { "type": "string", "description": "One session to read in full. Omit to list recent sessions." },
-                                        "project": { "type": "string", "description": "When listing, only sessions of this project." },
-                                        "limit": { "type": "integer", "minimum": 1, "default": 10, "description": "When listing, how many sessions." },
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"] }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_skeleton_write",
-                                "description": "remind-me pipeline: attach a Mermaid diagram of a capture's structure, so the conversation's shape can be read without reading the transcript. Each node maps to an inclusive, 1-based line range in the capture's dialog; remind_me_skeleton_read then drills into one node at a time. Ranges are validated against the dialog and the write is refused if any is out of bounds.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "capture_id": { "type": "string", "description": "The capture to describe" },
-                                        "mermaid": { "type": "string", "minLength": 1, "maxLength": 100000, "description": "Mermaid source, e.g. 'graph TD\\n  n1[Ask] --> n2[Investigate]'" },
-                                        "nodes": { "type": "object", "description": "Node id to [start_line, end_line], inclusive and 1-based, into the dialog. e.g. {\"n1\": [1, 12]}" }
-                                    },
-                                    "required": ["capture_id", "mermaid", "nodes"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_skeleton_read",
-                                "description": "remind-me pipeline: read a capture's skeleton. Without 'node' this returns the Mermaid diagram and its node map — the cheap view of a long conversation. With 'node' it returns only that node's lines of the dialog, which is how to drill in without pulling the whole transcript.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "capture_id": { "type": "string" },
-                                        "node": { "type": "string", "description": "A node id from the diagram. Omit for the diagram itself." }
-                                    },
-                                    "required": ["capture_id"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_source",
-                                "description": "Retrieve the raw imported bytes a memory was derived from — the original transcript envelope, including the tool calls, reasoning blocks and session metadata that importing deliberately strips out. Only available for memories imported while REMIND_ME_ARCHIVE_DIR was set; returns nothing otherwise.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "memory_id": { "type": "string", "description": "The memory whose source to fetch" },
-                                        "include_sensitive": { "type": "boolean", "default": false, "description": "Return the source even when the memory is marked sensitive. The raw source discloses more than the memory does, so this is off by default." }
-                                    },
-                                    "required": ["memory_id"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_normalize_batch",
-                                "description": "Fetch raw imported memories (document/chat imports) that have not been normalized yet, so they can be distilled into a {question, summary, resolution?} shape. The raw memory is kept, not replaced.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "batch_size": { "type": "integer", "default": 20, "minimum": NORMALIZE_BATCH_MIN, "maximum": NORMALIZE_BATCH_MAX }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_api_key",
-                                "description": "remind-me admin: issue, list, or revoke named dashboard API keys with a read or read-write scope. A read-scoped key is refused on every mutating HTTP route. The plaintext key is shown exactly once, at issuance — only its hash is stored, so it can be revoked and replaced but never recovered. Not multi-tenancy: every key reads and writes the same vault, only the permitted methods differ.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "action": { "type": "string", "enum": ["issue", "list", "revoke"], "default": "list" },
-                                        "name": { "type": "string", "description": "Key name; required for issue and revoke" },
-                                        "scope": { "type": "string", "enum": ["read", "read-write"], "default": "read", "description": "issue only" }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_reminders_ics_url",
-                                "description": "Return the subscribable ICS calendar feed URL for reminders. Paste it into a calendar app's \"subscribe by URL\" feature to see every upcoming and overdue-undelivered reminder as an event. WARNING: the URL embeds a secret token and whoever holds it can read every reminder's content — treat it exactly like a password. Rotate by deleting the token file.",
-                                "inputSchema": { "type": "object", "properties": {} }
-                            },
-                            {
-                                "name": "remind_me_set_reminder",
-                                "description": "Set a future reminder on an existing memory, or clear one already set. Pass an ISO-8601 timestamp for remind_at; omit it or pass null to clear. Naive timestamps are read as UTC. A timestamp already in the past is rejected rather than stored, because it could never fire.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
-                                        "memory_id": { "type": "string", "description": "The memory to set or clear a reminder on" },
-                                        "remind_at": { "type": ["string", "null"], "description": "ISO-8601 timestamp for when to surface this memory. Must be in the future. Omit or null to clear." }
-                                    },
-                                    "required": ["memory_id"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_list_reminders",
-                                "description": "List memories with a reminder set, soonest first. 'upcoming' is still in the future; 'overdue' came due but has not been delivered — typically because nothing was running when it fired; 'all' is both. A delivered reminder drops out of every window.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "when": { "type": "string", "enum": ["upcoming", "overdue", "all"], "default": "upcoming" },
-                                        "limit": { "type": "integer", "default": 20, "minimum": REMINDER_LIMIT_MIN, "maximum": REMINDER_LIMIT_MAX },
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown" }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_digest",
-                                "description": "A vault digest: memories added recently, and current vitality. Sensitive memories are always excluded, with no override — a digest is the ambient surface that flag exists to protect. Sections whose subsystem is not built yet are omitted rather than shown empty.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "since_days": { "type": "integer", "default": 7, "minimum": digest::DIGEST_SINCE_DAYS_MIN, "maximum": digest::DIGEST_SINCE_DAYS_MAX, "description": "How many days back counts as recent" },
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown" }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_contradiction_candidates",
-                                "description": "Surface pairs of memories that might assert incompatible things but were never caught by exact-triple supersession — two pieces of prose that conflict without either carrying a formal subject/predicate/object. Read-only: these are pairs that MIGHT conflict, and most turn out merely topically similar. Read both before acting; fix a real one with remind_me_update, remind_me_delete, or remind_me_add carrying an explicit triple. When both sides state the same subject and predicate with different objects, recommended_keep names the one to keep (higher confidence, then newer verified_at, then newer updated_at) and it is listed as memory_a. Paginate by passing the next_after_a/next_after_b from one response as after_a/after_b on the next call, and stop when has_more is false — without a cursor every call returns the same first page, so a large queue has only `limit` reachable rows.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "limit": { "type": "integer", "default": 20, "minimum": CONTRADICTION_LIMIT_MIN, "maximum": CONTRADICTION_LIMIT_MAX },
-                                        "after_a": { "type": "string", "description": "Keyset cursor: next_after_a from the previous response. Must be passed together with after_b." },
-                                        "after_b": { "type": "string", "description": "Keyset cursor: next_after_b from the previous response. Must be passed together with after_a." }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_history",
-                                "description": "List a memory's edit history — snapshots of its content, category, tags, metadata and sensitive flag taken before each edit replaced them. Newest first. Revision ids from here are what remind_me_revert takes.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "memory_id": { "type": "string" },
-                                        "limit": { "type": "integer", "default": 10, "minimum": HISTORY_LIMIT_MIN, "maximum": HISTORY_LIMIT_MAX },
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown" }
-                                    },
-                                    "required": ["memory_id"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_revert",
-                                "description": "remind-me pipeline: restore a memory's content, category, tags, metadata and sensitive flag to a prior revision. Reverting is itself an edit: it records a new revision of the state just before the revert, so a revert can be undone.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
-                                        "memory_id": { "type": "string" },
-                                        "revision_id": { "type": "integer", "description": "A revision id from remind_me_history for this same memory" },
-                                        "reason": { "type": "string", "description": "Optional note recorded on the revision this revert creates" }
-                                    },
-                                    "required": ["memory_id", "revision_id"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_save_search",
-                                "description": "Save a query and its filters under a unique name, so a recurring question does not have to be retyped. Re-saving the same name updates it in place. Set watch=true to have polling report matches that have not been seen before.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
-                                        "name": { "type": "string", "description": "Unique name for this saved search" },
-                                        "query": { "type": "string", "description": "The search query to store and later re-run" },
-                                        "category": { "type": "string", "description": "Optional category filter" },
-                                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional tag filter; a memory must have ALL of these" },
-                                        "include_sensitive": { "type": "boolean", "default": false, "description": "Whether re-running this search includes memories marked sensitive" },
-                                        "watch": { "type": "boolean", "default": false, "description": "Poll this search and report matches not seen before. Does not narrow what running it returns." }
-                                    },
-                                    "required": ["name", "query"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_list_saved_searches",
-                                "description": "List every saved search, alphabetical by name, with its stored query, filters and watch flag.",
-                                "inputSchema": { "type": "object", "properties": { "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." } } }
-                            },
-                            {
-                                "name": "remind_me_run_saved_search",
-                                "description": "Re-run a saved search's stored query and filters. Returns all current matches — watching does not narrow this; the unseen-only diff belongs to polling.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "name": { "type": "string", "description": "Name of the saved search to run" }
-                                    },
-                                    "required": ["name"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_pin_saved_search",
-                                "description": "Make a saved search a pinned question: a standing answer that is flagged when it goes out of date.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "name": { "type": "string", "description": "Name of the saved search to pin" }
-                                    },
-                                    "required": ["name"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_answer_pinned",
-                                "description": "Record a pinned question's answer: an existing wiki page and the live memory ids it was written from. Pins the search if needed.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "name": { "type": "string", "description": "Name of the saved search" },
-                                        "answer_slug": { "type": "string", "description": "Slug of the wiki page holding the answer" },
-                                        "evidence_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": PIN_EVIDENCE_MAX, "description": "The memories the answer was written from" },
-                                        "as_of": { "type": "string", "description": "RFC 3339 time the evidence was read: checked_at from list_stale, or when you ran the search. Stamped as answered_at, capped at now; refused if the saved search changed after it; omitted means now" }
-                                    },
-                                    "required": ["name", "answer_slug", "evidence_ids"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_list_stale_pinned",
-                                "description": "List pinned questions whose answer is out of date, with checked_at (pass it to answer as as_of), each with its reasons, up to 5 new memory ids to read before answering again, and any evidence ids now deleted or superseded.",
-                                "inputSchema": { "type": "object", "properties": {} }
-                            },
-                            {
-                                "name": "remind_me_delete_saved_search",
-                                "description": "Delete a saved search by name, along with the seen-memory rows its watch tracking accumulated.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "name": { "type": "string", "description": "Name of the saved search to delete" }
-                                    },
-                                    "required": ["name"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_undo_import",
-                                "description": "remind-me import: roll back a previous import, removing its memories and its tracking rows. Defaults to a dry run — pass dry_run=false to actually delete. On a sync-enabled node this soft-deletes: a tombstone without the memory's text stays, so the removal propagates to every other node. Resumable: call again until 'remaining' is 0.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "import_kind": { "type": "string", "enum": ["chat", "dbs", "mempalace"], "description": "Which import to undo" },
-                                        "import_id": { "type": "string", "description": "Scope to one import run. For 'chat' the chat_imports import_id; for 'dbs' the dbs_source; for 'mempalace' a drawer_id prefix. Omit to target every record of that kind." },
-                                        "dry_run": { "type": "boolean", "default": true, "description": "When true (the default), report what would be removed and change nothing." },
-                                        "limit": { "type": "integer", "default": 500, "minimum": UNDO_IMPORT_LIMIT_MIN, "maximum": UNDO_IMPORT_LIMIT_MAX, "description": "Maximum memories to remove per call. Work is resumable." }
-                                    },
-                                    "required": ["import_kind"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_recalibrate_candidates",
-                                "description": "Fetch memories whose importance classification may be stale: they look important (high base_weight, or a durable memory_type like decision/fact) yet have gone untouched for 90+ days and have never received feedback. Read-only — review each and apply changes with remind_me_reclassify (a type change) or remind_me_feedback (a pure importance nudge). Most candidates will look fine; this only narrows an unbounded set to a reviewable batch.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "limit": { "type": "integer", "default": 20, "minimum": RECALIBRATE_LIMIT_MIN, "maximum": RECALIBRATE_LIMIT_MAX, "description": "Number of importance-review candidates to return" }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_normalize_apply",
-                                "description": "remind-me pipeline: write distilled normalizations back as new memories, each linked to the raw import it came from via a normalized_from metadata pointer. The raw memory is left untouched.",
-                                "inputSchema": normalize_apply_input_schema()
-                            },
-                            {
-                                "name": "remind_me_entity_traverse",
-                                "description": "remind-me pipeline: multi-hop traversal of the typed entity-relation graph from a starting entity. Unlike remind_me_entity (one entity's direct facts) this follows entity_relations edges in both directions, so it answers questions that chain relations rather than co-mention.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "name": { "type": "string", "description": "Entity name or alias to start from (case/whitespace-insensitive)", "minLength": 1, "maxLength": 200 },
-                                        "hops": { "type": "integer", "default": 1, "minimum": 1, "maximum": 3, "description": "Maximum traversal depth. 1 = direct relations only." },
-                                        "relation": { "type": "string", "maxLength": 200, "description": "Optional: only follow edges whose relation label matches exactly" },
-                                        "cap": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100, "description": "Max number of relation edges to return" }
-                                    },
-                                    "required": ["name"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_wiki_write",
-                                "description": "remind-me wiki: write or update a markdown wiki page.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "title": { "type": "string", "minLength": 1, "maxLength": 200, "description": "The title's slug is the page's identity — keep titles stable so [[wikilinks]] resolve" },
-                                        "content": { "type": "string", "minLength": 1, "maxLength": 100000, "description": "Full markdown body, REPLACING any existing content. Open with a one-sentence summary; it becomes the index entry. A leading '# Title' is added if absent." },
-                                        "log_note": { "type": "string", "maxLength": 500, "description": "Optional note recorded in log.md alongside the change" }
-                                    },
-                                    "required": ["title", "content"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_wiki_read",
-                                "description": "Read a wiki page by slug. stale and new_evidence say whether newer memories share an entity with the ids it cites (null: it cites none).",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
-                                        "slug": { "type": "string" }
-                                    },
-                                    "required": ["slug"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_wiki_import",
-                                "description": "Import a directory of Markdown files into the wiki. Each file's slug/title/topic come from its YAML front matter, falling back to its first '# ' heading then its filename. Idempotent - pages upsert on slug. Pairs with `dbs export-wiki --out-dir` from daily-backup-system.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "dir": { "type": "string" },
-                                        "recursive": { "type": "boolean", "default": true }
-                                    },
-                                    "required": ["dir"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_reclassify",
-                                "description": "remind-me pipeline: apply memory_type classifications. Updates each memory's decay rate to match its new type.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "classifications": {
-                                            "type": "array",
-                                            "minItems": 1,
-                                            "maxItems": 100,
-                                            "items": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "memory_id": { "type": "string" },
-                                                    "memory_type": { "type": "string" }
-                                                },
-                                                "required": ["memory_id", "memory_type"]
-                                            }
-                                        }
-                                    },
-                                    "required": ["classifications"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_reclassify_batch",
-                                "description": "Fetch a batch of still-unclassified memories, with content snippets, to classify and feed back through remind_me_reclassify.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "batch_size": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_feedback",
-                                "description": "remind-me pipeline: mark a memory helpful or unhelpful. Without `query` this is a global judgement that adjusts the memory's weight; with `query` it is recorded as feedback for similar future searches only.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "memory_id": { "type": "string" },
-                                        "signal": { "type": "string", "enum": ["helpful", "unhelpful"] },
-                                        "query": { "type": "string", "maxLength": 500 }
-                                    },
-                                    "required": ["memory_id", "signal"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_backup",
-                                "description": "remind-me admin: create a WAL-safe online backup of the memory database, beside the database file. Older backups beyond the retention count are pruned.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {}
-                                }
-                            },
-                            {
-                                "name": "remind_me_annotate",
-                                "description": "remind-me pipeline: apply subject/predicate/object triples and entity mentions to existing memories, in batches of up to 100.",
-                                "inputSchema": annotate_input_schema()
-                            },
-                            {
-                                "name": "remind_me_vitality_report",
-                                "description": "Vault health report: active/dormant counts, average vitality, distribution buckets, and a breakdown by category.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default, as the reference) returns the structured report; markdown renders it for reading." }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_wiki_load",
-                                "description": "Load the whole wiki into context as one markdown document, newest-revised first up to a token budget. Overflow is listed by title so it can be read individually.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "token_budget": { "type": "integer", "default": 0, "minimum": 0, "maximum": 200000, "description": "0 means unlimited" },
-                                        "include_index": { "type": "boolean", "default": true }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_wiki_compile",
-                                "description": "remind-me wiki: drive wiki synthesis over raw memories. With mark_integrated=false (the default) returns a brief of pending sources and never advances the watermark, so it is safe to call repeatedly. Call again with mark_integrated=true and the brief's `through` after writing the pages, so exactly that brief's sources are marked. With auto=true the server's own local model (REMIND_ME_WIKI_LLM_URL and _MODEL) writes the pages and marks each batch itself; this can take minutes per batch.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
-                                        "limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
-                                        "mark_integrated": { "type": "boolean", "default": false },
-                                        "through": { "type": "string", "description": "With mark_integrated=true: the `through` a brief returned. Marks exactly that brief's sources. Without it the batch is recomputed, which an edit in between can change." },
-                                        "auto": { "type": "boolean", "default": false, "description": "Have the configured local model write the pages. Ignores limit, mark_integrated and through." },
-                                        "max_batches": { "type": "integer", "default": 1, "minimum": 1, "maximum": 20, "description": "With auto=true: batches to compile before returning." },
-                                        "allow_shrink": { "type": "boolean", "default": false, "description": "With auto=true: accept a rewrite that shortens a page below 95% or drops one of its [[links]], headings or `backticked` details." }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_wiki_search",
-                                "description": "Full-text search wiki page titles and content, ranked by BM25.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "query": { "type": "string", "minLength": 1, "maxLength": 500 },
-                                        "limit": { "type": "integer", "default": 10, "minimum": 1, "maximum": 50 }
-                                    },
-                                    "required": ["query"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_wiki_list",
-                                "description": "List every wiki page, most recently updated first.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown", "description": "markdown (default, as the reference) renders the wiki index; json returns count and pages." },}
-                                }
-                            },
-                            {
-                                "name": "remind_me_wiki_delete",
-                                "description": "remind-me wiki: delete a wiki page by title or slug.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "title": {
-                                            "type": "string",
-                                            "description": "Page title or slug",
-                                            "minLength": 1,
-                                            "maxLength": 200
-                                        }
-                                    },
-                                    "required": ["title"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_consolidate",
-                                "description": "remind-me pipeline: find clusters of near-duplicate memories by embedding similarity and optionally merge them into one canonical representative. dry_run (default true) reports clusters — canonical, members, and each member's similarity to the canonical — without changing anything. To actually merge, review the report, write a short summary per cluster you want consolidated, then call again with dry_run=false and summaries={canonical_id: summary}; a cluster with no matching summary is skipped, not merged with a raw concatenation.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "similarity_threshold": { "type": "number", "default": 0.85, "minimum": CONSOLIDATE_SIMILARITY_MIN, "maximum": CONSOLIDATE_SIMILARITY_MAX, "description": "Minimum cosine similarity to cluster memories together. Higher = stricter." },
-                                        "dry_run": { "type": "boolean", "default": true, "description": "If true, report clusters without modifying data. Set false to auto-merge." },
-                                        "category": { "type": "string", "description": "Limit consolidation to this category" },
-                                        "limit": { "type": "integer", "default": 500, "minimum": CONSOLIDATE_LIMIT_MIN, "maximum": CONSOLIDATE_LIMIT_MAX, "description": "Maximum memories to consider (prevents runaway on large vaults)" },
-                                        "summaries": { "type": "object", "additionalProperties": { "type": "string" }, "description": "{canonical_id: summary}, one entry per cluster (from a prior dry_run=true call) you want consolidated. Required to actually merge a cluster when dry_run=false." }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_resolve",
-                                "description": "Close a remind-me decision or action item with `outcome`: done, abandoned, reverted, superseded, or carded (moved to a board card, so no longer open but not done). Or record a decision's follow-up review with `review`: whether it held up, which is separate from whether it was carried out. Pass exactly one. A reverted or abandoned one loses half its weight so it stops outranking what replaced it; the prior state is kept in history.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "memory_id": { "type": "string" },
-                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded", "carded"] },
-                                        "review": { "type": "string", "enum": ["held", "revised", "reverted"], "description": "Decisions only. `reverted` also sets outcome to reverted." },
-                                        "note": { "type": "string", "description": "Why; stored as metadata.outcome_note, or metadata.review.note for a review." }
-                                    },
-                                    "required": ["memory_id"]
-                                }
-                            },
-                            {
-                                "name": "remind_me_stats",
-                                "description": "Get database stats and memory counts.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown" }
-                                    }
-                                }
-                            }
-                        ]
-                    }
-                });
+                let mut listed = handler_table(req_id);
                 // The literal above is every handler under its own name;
                 // what is advertised is the public surface built from it
                 // (ADR-0030). Handlers keep their pre-0.5 names so an alias
@@ -1749,7 +810,8 @@ impl McpServer {
                 let req_id = id.unwrap_or(json!(1));
                 let params = req.get("params")?;
                 let tool_name = params.get("name")?.as_str()?;
-                let args = params.get("arguments").cloned().unwrap_or(json!({}));
+                let mut args = params.get("arguments").cloned().unwrap_or(json!({}));
+                apply_client_format(tool_name, &mut args);
                 // Read before `args` is moved into any tool's input model.
                 let format = requested_format(&args);
                 // Hidden means gone, not merely undocumented: a model that
@@ -1767,19 +829,7 @@ impl McpServer {
                             "isError": true,
                             "content": [{
                                 "type": "text",
-                                "text": match remind_me_core::tool_profiles::group_of(tool_name) {
-                                    Some(group) => format!(
-                                        "Tool '{tool_name}' is not available under the '{profile}' \
-                                         tool profile. It is in the '{group}' group: set \
-                                         {env}={profile},{group}, or {env}=full for the whole surface.",
-                                        env = remind_me_core::tool_profiles::TOOL_PROFILE_ENV
-                                    ),
-                                    None => format!(
-                                        "Tool '{tool_name}' is not available under the '{profile}' \
-                                         tool profile. Set {}=full to expose the whole surface.",
-                                        remind_me_core::tool_profiles::TOOL_PROFILE_ENV
-                                    ),
-                                }
+                                "text": profile_refusal(tool_name, &profile)
                             }]
                         }
                     }));
@@ -2339,6 +1389,8 @@ impl McpServer {
                                 "profile": profile,
                                 "groups": remind_me_core::tool_profiles::allowed_groups(&profile)
                                     .map(|g| g.into_iter().collect::<Vec<_>>()),
+                                "tools": remind_me_core::tool_profiles::allowed_tools(&profile)
+                                    .map(|t| t.len()),
                                 "env": remind_me_core::tool_profiles::TOOL_PROFILE_ENV,
                             });
                             {
@@ -3688,6 +2740,1023 @@ fn request_profile() -> String {
     remind_me_core::tool_profiles::configured_profile()
 }
 
+/// Why `tool` is refused under `profile`, naming the group it is in and the
+/// setting that turns it on: the client's `profile` in `clients.json` when
+/// the profile came from there, else the environment variable (D111).
+fn profile_refusal(tool: &str, profile: &str) -> String {
+    let env = remind_me_core::tool_profiles::TOOL_PROFILE_ENV;
+    let from_registry =
+        remind_me_core::clients::current_entry().is_some_and(|e| e.profile.is_some());
+    let set = |value: &str| {
+        if from_registry {
+            format!("this client's \"profile\" in clients.json to \"{value}\"")
+        } else {
+            format!("{env}={value}")
+        }
+    };
+    let head = format!("Tool '{tool}' is not available under the '{profile}' tool profile.");
+    match remind_me_core::tool_profiles::group_of(tool) {
+        Some(group) => format!(
+            "{head} It is in the '{group}' group: set {}, or {} for the whole surface.",
+            set(&format!("{profile},{group}")),
+            set("full")
+        ),
+        None => format!("{head} Set {} to expose the whole surface.", set("full")),
+    }
+}
+
+/// Give a call that sends no `response_format` its client's registry
+/// `format` (ADR-0028 §2, D110), on every tool whose schema takes one. An
+/// explicit value wins; with no registry format nothing changes.
+fn apply_client_format(tool: &str, args: &mut Value) {
+    let Some(map) = args.as_object_mut() else {
+        return;
+    };
+    if map.contains_key("response_format") || !takes_response_format(tool) {
+        return;
+    }
+    let Some(format) = remind_me_core::clients::current_entry().and_then(|e| e.format) else {
+        return;
+    };
+    let value = match format {
+        ResponseFormat::Json => "json",
+        ResponseFormat::Markdown => "markdown",
+    };
+    map.insert("response_format".to_string(), json!(value));
+}
+
+/// Whether `tool` (a handler name, or an alias of one) declares a
+/// `response_format` input. Read once from [`handler_table`].
+fn takes_response_format(tool: &str) -> bool {
+    static NAMES: std::sync::OnceLock<std::collections::BTreeSet<String>> =
+        std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        let table = handler_table(json!(1));
+        table["result"]["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter(|t| !t["inputSchema"]["properties"]["response_format"].is_null())
+                    .filter_map(|t| t["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    names.contains(tool)
+}
+
+/// Every tool handler under its own name, with its schema: the literal
+/// `tools/list` builds the public surface from (ADR-0030).
+fn handler_table(req_id: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "tools": [
+                {
+                    "name": "remind_me_add",
+                    "description": "Save a fact, decision, preference or note to remind-me memory; call this whenever the user states something durable. A decision needs metadata.rationale. Saving a decision checks it against the standing, non-sensitive decisions in the same project on the same claim or a shared entity and returns likely conflicts as contradiction_candidates. Any memory returns likely near-duplicates in its project as duplicate_candidates. Nothing is blocked or superseded automatically. Pass supersedes to retire the old decision in the same call. When the event happened at another time than now, set metadata.occurred_at (RFC 3339, or {from, to}), resolving relative dates to absolute ones.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
+                            "content": { "type": "string" },
+                            "category": { "type": "string", "default": "general" },
+                            "tags": { "type": "array", "items": { "type": "string" } },
+                            "source": { "type": "string", "default": "manual" },
+                            "sensitive": { "type": "boolean", "default": false, "description": "Mark this memory sensitive: kept out of ordinary search and list results unless include_sensitive is set. A convenience flag, NOT access control — this is a single-user store and anyone with the database reads everything regardless." },
+                            "extract": { "type": "boolean", "default": true, "description": "Extract references (issues, commits, URLs, paths, handles) and entities from the content. REMIND_ME_EXTRACT=0 disables it globally." },
+                            "attachments": {
+                                "type": "array",
+                                "description": "Files or URLs this memory points at. A path is hashed (sha256) and only the fingerprint, size and mime type are stored, never the bytes.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": { "type": "string" },
+                                        "url": { "type": "string" },
+                                        "label": { "type": "string" }
+                                    }
+                                }
+                            },
+                            "project": { "type": "string", "maxLength": 200, "description": "The project this memory belongs to, e.g. a registered project name. Replaces the project detected from the writer's directory; blank is unset." },
+                            "metadata": { "type": "object", "description": "Free-form JSON stored with the memory; a decision requires a `rationale` string here, an action_item may hold due, owner and status. occurred_at: when the event happened, RFC 3339 or {from, to}." },
+                            "subject": { "type": "string", "description": "Subject of a subject-predicate-object fact. remind_me_add does not supersede a live triple with the same subject and predicate; name it in supersedes to do so." },
+                            "predicate": { "type": "string", "description": "Predicate of the fact triple." },
+                            "object": { "type": "string", "description": "Object of the fact triple." },
+                            "entities": {
+                                "type": "array",
+                                "description": "Entities this memory mentions, linked into the knowledge graph.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string" },
+                                        "kind": { "type": "string" },
+                                        "aliases": { "type": "array", "items": { "type": "string" } }
+                                    },
+                                    "required": ["name"]
+                                }
+                            },
+                            "memory_type": { "type": "string", "enum": ["decision", "action_item", "preference", "fact", "reference", "insight", "learning", "blocker", "work_log", "unclassified"], "description": "What kind of memory this is; a decision requires metadata.rationale." },
+                            "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 1, "description": "How far to trust this memory; scales its search ranking." },
+                            "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold; omit for always." },
+                            "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
+                            "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded", "carded"], "description": "Only for decision and action_item memories; prefer remind_me_resolve for an existing one." },
+                            "supersedes": { "type": "array", "items": { "type": "string" }, "description": "IDs of live memories this one replaces, e.g. a contradiction_candidates id. Each is marked superseded by the new memory, in one transaction with the add; an id that is missing, deleted, already superseded or a project claim refuses the whole add." }
+                        },
+                        "required": ["content"]
+                    }
+                },
+                {
+                    "name": "remind_me_get",
+                    "description": "Get memories by ID: one with memory_id, or several with memory_ids (e.g. the ids a compact remind_me_search returned or trimmed). memory_ids returns {memories, missing}.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "memory_id": { "type": "string" },
+                            "memory_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": GET_IDS_MAX, "description": "Fetch several memories in one call. Use instead of memory_id, not with it." },
+                            "id": { "type": "string", "description": "Deprecated alias for memory_id. Prefer memory_id; kept for backward compatibility." }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_list",
+                    "description": "List memories with optional filtering by category, tags, or source. Results are paginated, newest first.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown", "description": "markdown (default, as the reference) renders the memories; json returns the structured page." },
+                            "category": { "type": "string" },
+                            "tags": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Memory must have ALL of these tags"
+                            },
+                            "source": { "type": "string" },
+                            "project": { "type": "string", "description": "Only memories written in this project (case-insensitive)" },
+                            "project_status": { "type": "string", "enum": ["active", "dormant", "abandoned"], "description": "Only memories whose project is a registered project (remind_me_project, by name or alias) with this status" },
+                            "branch": { "type": "string", "description": "Only memories written on this git branch" },
+                            "session_id": { "type": "string", "description": "Only memories written in this client session" },
+                            "written_by": { "type": "string", "description": "Only memories by this writer: human, hook, model, model:<id> or importer:<name>" },
+                            "limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
+                            "offset": { "type": "integer", "default": 0, "minimum": 0 },
+                            "include_sensitive": { "type": "boolean", "default": false, "description": "Include memories marked sensitive. Off by default, so sensitive content never surfaces in an ordinary request." }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_update",
+                    "description": "Update an existing memory's content, category, tags, or metadata. A content or type change that leaves a decision returns likely conflicting standing decisions as contradiction_candidates.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
+                            "memory_id": { "type": "string" },
+                            "content": { "type": "string" },
+                            "category": { "type": "string" },
+                            "tags": { "type": "array", "items": { "type": "string" } },
+                            "metadata": { "type": "object" },
+                            "sensitive": { "type": "boolean", "description": "Set or clear the sensitive flag. Omit to leave it unchanged." },
+                            "clear_superseded": { "type": "boolean", "default": false, "description": "Clear this memory's superseded_by flag, un-hiding it from search, entity, and subject/predicate lookups. Recovery path for a false-positive contradiction-supersession. Does not affect the memory that did the superseding." },
+                            "memory_type": { "type": "string", "enum": ["decision", "action_item", "preference", "fact", "reference", "insight", "learning", "blocker", "work_log", "unclassified"], "description": "Reclassify; a decision requires metadata.rationale (in this call or already stored)." },
+                            "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "How far to trust this memory; scales its search ranking." },
+                            "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold." },
+                            "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
+                            "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded", "carded"], "description": "Only for decision and action_item memories." },
+                            "project": { "type": "string", "description": "Set the memory's project (trimmed, one line, at most 200 bytes). Omit or leave blank to keep it; it cannot be cleared." }
+                        },
+                        "required": ["memory_id"]
+                    }
+                },
+                {
+                    "name": "remind_me_delete",
+                    "description": "Delete one remind-me memory by id, when the user asks to forget it or it is wrong.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "memory_id": { "type": "string" }
+                        },
+                        "required": ["memory_id"]
+                    }
+                },
+                {
+                    "name": "remind_me_search",
+                    "description": "Search memories using FTS5 keyword & hybrid ranking. tags, entity, topic, repo and the project/branch/session/writer filters narrow the ranked results before the limit applies. Returns compact hits by default (id, category, date, tags, score, snippet); fetch full text with remind_me_get memory_ids, or pass detail=full. Hits cut by token_budget are listed by id. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown", "description": "markdown (default, as the reference) renders the results; json returns the full envelope including scores." },
+                            "query": { "type": "string", "description": "Search text. May be empty when since or until is set, to list that window newest-first. When the server sets REMIND_ME_DATE_PHRASES=on and no since/until is given, a relative date phrase in it (yesterday, last week, past 3 days, since monday) becomes the window and leaves the text; the response's inferred_window says so." },
+                            "limit": { "type": "integer", "default": 20 },
+                            "detail": { "type": "string", "enum": ["compact", "full"], "default": "compact", "description": "compact (default): one short line per hit, so more hits fit the budget. full: whole memories with metadata and references." },
+                            "token_budget": { "type": "integer", "default": 800, "minimum": 0, "description": "Estimated tokens the hits may use; 0 is unlimited. Hits that do not fit are listed by id." },
+                            "category": { "type": "string" },
+                            "tags": { "type": "array", "items": { "type": "string" }, "description": "Only memories carrying these tags (see tag_mode)" },
+                            "tag_mode": { "type": "string", "enum": ["all", "any"], "default": "all", "description": "all: every tag must be present; any: at least one" },
+                            "entity": { "type": "string", "description": "Only memories about this entity, by name or alias: linked to it, or naming it as subject or object. An unknown entity matches nothing." },
+                            "topic": { "type": "string", "description": "Only memories in this topic or any topic below it, e.g. Systems Engineering. An unknown topic matches nothing." },
+                            "repo": { "type": "string", "description": "Only memories written in this git repository (origin remote, any URL form, e.g. github.com/owner/repo)" },
+                            "project": { "type": "string", "description": "Only memories written in this project (case-insensitive)" },
+                            "project_status": { "type": "string", "enum": ["active", "dormant", "abandoned"], "description": "Only memories whose project is a registered project (remind_me_project, by name or alias) with this status" },
+                            "branch": { "type": "string", "description": "Only memories written on this git branch" },
+                            "session_id": { "type": "string", "description": "Only memories written in this client session" },
+                            "written_by": { "type": "string", "description": "Only memories by this writer: human, hook, model, model:<id> or importer:<name>" },
+                            "include_dormant": { "type": "boolean", "default": false, "description": "Include memories that have decayed below the vitality floor" },
+                            "min_vitality": { "type": "number", "default": 0, "description": "Only return memories at or above this current vitality" },
+                            "expand_entities": { "type": "boolean", "default": false, "description": "Also surface memories mentioning the same entities" },
+                            "include_neighbors": { "type": "boolean", "default": false, "description": "Also surface adjacent chunks of the same source document" },
+                            "expand_co_retrieval": { "type": "boolean", "default": false, "description": "Also surface memories frequently retrieved alongside these" },
+                            "include_sensitive": { "type": "boolean", "default": false, "description": "Include memories marked sensitive. Off by default, so sensitive content never surfaces in an ordinary request." },
+                            "bootstrap": { "type": "boolean", "default": false, "description": "Prepend the durable persona (L3) as context, whether or not it matches the query. Spends up to a quarter of token_budget; the rest still goes to the ranked results." },
+                            "include_expired": { "type": "boolean", "default": true, "description": "Include memories whose valid_until has passed. They always rank after in-window ones; set false to drop them." },
+                            "min_confidence": { "type": "number", "default": 0, "description": "Only return memories at or above this confidence (0 to 1)." },
+                            "include_raw": { "type": "boolean", "default": false, "description": "Rank raw session dialogs and skeletons too. Off by default: facts and summaries rank, and each carries the capture_id of its dialog. A dialog category or a session_id filter turns it on, and when nothing refined matches the best dialogs come back marked as raw." },
+                            "since": { "type": "string", "description": "Only memories at or after this time (inclusive): RFC 3339, an age back from now like 30m, 12h, 2d, 1w, or a date phrase like yesterday, last week, past 3 days, since monday, in march, Q3, 2026-10 or 2026-01 to 2026-03. A phrase naming a whole period (yesterday, last week, Q3) also ends the window at that period's end unless until is given. Phrases use the server's REMIND_ME_TZ calendar (UTC if unset)." },
+                            "until": { "type": "string", "description": "Only memories before this time (exclusive): RFC 3339, an age back from now like 30m, 12h, 2d, 1w, or a date phrase naming a period, which ends the window at that period's end (today, last month, Q3). Must be after since." },
+                            "time_field": { "type": "string", "enum": ["created", "updated", "occurred"], "default": "created", "description": "Which timestamp since/until apply to. occurred: metadata.occurred_at, else created; a {from, to} span counts when it overlaps the window." },
+                            "strategy": { "type": "string", "enum": ["auto", "balanced", "keyword_favored", "semantic_favored"], "default": "auto", "description": "RRF weight profile. Leave at auto (routes by query shape: quoted phrases, prefix* wildcards and very short queries favour keyword relevance; long or question-shaped queries favour semantic similarity) unless deliberately A/B testing a pinned preset." }
+                        },
+                        "required": ["query"]
+                    }
+                },
+                {
+                    "name": "remind_me_brief",
+                    "description": "Get a remind-me brief for one project: current state, open blockers, decisions and action items, and recent activity, with ids for remind_me_get.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "project": { "type": "string", "description": "Project or entity name, or an alias" },
+                            "since": { "type": "string", "default": context_brief::DEFAULT_SINCE, "description": "Activity window start: 7d, 12h, an RFC 3339 time or a date phrase such as yesterday or last week (its start), at most 365 days back" },
+                            "token_budget": { "type": "integer", "default": context_brief::DEFAULT_TOKEN_BUDGET, "minimum": context_brief::MIN_TOKEN_BUDGET, "maximum": context_brief::MAX_TOKEN_BUDGET },
+                            "response_format": { "type": "string", "enum": ["json", "markdown"] }
+                        },
+                        "required": ["project"]
+                    }
+                },
+                {
+                    "name": "remind_me_entity",
+                    "description": "Look up everything remind-me knows about ONE named thing: a person, project, tool, org or place. Read-only: returns the entity record, its facts, the memories mentioning it and any possible_duplicates (likely the same thing under another spelling; never merged), or found=false for an unknown name. Use remind_me_search for topic questions or anything you cannot name exactly.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "Entity name or alias, resolved case- and whitespace-insensitively" },
+                            "limit": { "type": "integer", "default": 20, "minimum": ENTITY_LOOKUP_LIMIT_MIN, "maximum": ENTITY_LOOKUP_LIMIT_MAX, "description": "Maximum facts and maximum linked memories to return" }
+                        },
+                        "required": ["name"]
+                    }
+                },
+                {
+                    "name": "remind_me_project",
+                    "description": remind_me_core::project_tool::DESCRIPTION,
+                    "inputSchema": remind_me_core::project_tool::input_schema()
+                },
+                {
+                    "name": "remind_me_entity_upsert",
+                    "description": "remind-me pipeline: create a knowledge-graph entity, or update its kind. remind_me_entity is read-only, so writing is a separate, explicit call. The answer lists possible_duplicates when the name likely matches an existing entity (rusty_mux vs rusty-mux); nothing is merged. Adding one name as an alias of the other marks a pair reviewed.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "kind": { "type": "string" },
+                            "aliases": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["name"]
+                    }
+                },
+                {
+                    "name": "remind_me_import_chat",
+                    "description": "Import a chat export or document file into memory. .json/.jsonl are chat exports; .md/.markdown/.txt are content-sniffed in auto mode — chat role markers import as chat, everything else as a document chunked per section. Deduplicates by file content hash. The path must be inside the allowed import roots.",
+                    "inputSchema": import_input_schema(false)
+                },
+                {
+                    "name": "remind_me_import_directory",
+                    "description": "Import every supported file in a directory. Same parsing and per-file dedup as remind_me_import_chat.",
+                    "inputSchema": import_input_schema(true)
+                },
+                {
+                    "name": "remind_me_import_dbs",
+                    "description": "Bulk-import a daily-backup-system (dbs) archive. Reads its items/sources tables directly, read-only, and turns each live item into a memory with dbs's source and tags preserved as knowledge-graph entities rather than flattened into prose. Reruns are safe: unchanged items are skipped, and an item edited since its last import gets a fresh memory that supersedes the old one. Page a large archive with offset until has_more is false.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "db_path": { "type": "string", "description": "Path to the dbs SQLite archive, inside the allowed import roots" },
+                            "source": { "type": "string", "description": "Restrict to one dbs source name (e.g. 'raindrop'). Omit for all." },
+                            "item_type": { "type": "string", "description": "Restrict to one dbs item_kind (e.g. 'link'). Omit for all." },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": DBS_IMPORT_LIMIT_MIN,
+                                "maximum": DBS_IMPORT_LIMIT_MAX,
+                                "default": 500
+                            },
+                            "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                            "tags": { "type": "array", "items": { "type": "string" }, "description": "Extra tags added to every imported memory" },
+                            "dry_run": { "type": "boolean", "default": false, "description": "Report what would be imported without writing" }
+                        },
+                        "required": ["db_path"]
+                    }
+                },
+                {
+                    "name": "remind_me_import_mempalace",
+                    "description": "Bulk-import memories from a MemPalace ChromaDB store, one page at a time. Reads its metadata segment directly, read-only, rather than one drawer at a time via MemPalace's own tools. A drawer carrying remind_me's own memory frontmatter has its category/tags/created restored; everything else is stored as one opaque memory per drawer, tagged with its wing and room. Already-imported drawers are skipped (tracked by drawer id), so reruns are safe. Reads REMIND_ME_MEMPALACE_PATH for the store location.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "wing": { "type": "string", "description": "Restrict to one wing (project). Omit for all." },
+                            "room": { "type": "string", "description": "Restrict to one room within the wing. Omit for all." },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": MEMPALACE_IMPORT_LIMIT_MIN,
+                                "maximum": MEMPALACE_IMPORT_LIMIT_MAX,
+                                "default": 500
+                            },
+                            "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                            "category": { "type": "string", "description": "Category for a drawer with no restorable frontmatter category (default: mempalace_import)" },
+                            "tags": { "type": "array", "items": { "type": "string" }, "description": "Extra tags added to every imported memory" },
+                            "dry_run": { "type": "boolean", "default": false, "description": "Report what would be imported without writing" }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_watch_status",
+                    "description": "Report the folder watcher: which directories are watched, which were refused for sitting outside the import roots, scan counts, and recent errors. Says what to configure when nothing is.",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "remind_me_check_update",
+                    "description": "Check whether this checkout is behind origin/main. Read-only: fetches from the remote and compares commits, never modifies anything.",
+                    "inputSchema": { "type": "object", "properties": { "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." } } }
+                },
+                {
+                    "name": "remind_me_revoke_clients",
+                    "description": "remind-me admin: list OAuth clients registered with the remote connector's authorization server (FT-07), or revoke one by client_id. Without client_id, lists every registered client with its live access/refresh token counts -- this is the read path, not a bulk-revoke shorthand: there is no 'revoke all' operation, only 'list' (empty client_id) and 'revoke this one client' (client_id set). With client_id, deletes that client's registration and every token it holds; the live remote server re-reads the state file on each token check, so the client is locked out immediately and must re-register and re-obtain the owner's consent to reconnect.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "client_id": { "type": "string", "default": "", "description": "The client to revoke. Empty (default) lists clients instead of revoking anything." }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_reindex",
+                    "description": "remind-me admin: rebuild vector embeddings for every memory that doesn't have one yet. Existing embeddings are preserved; only missing ones are generated. Run this after configuring REMIND_ME_EMBEDDING_BACKEND, or after a bulk import that ran before an embedder was available. Reports 'degraded' when no embedder is configured or reachable, rather than silently doing nothing.",
+                    "inputSchema": { "type": "object", "properties": { "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." } } }
+                },
+                {
+                    "name": "remind_me_webhook_status",
+                    "description": "Report the push ingestion endpoint: whether a secret is configured, whether it is listening, where, and how many pushes it has ingested, skipped or refused. Distinguishes 'nobody configured one' from 'configured but the port could not be bound'.",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "remind_me_list_connectors",
+                    "description": "List every registered import connector — the pluggable parsers behind remind_me_import_chat's `kind` parameter.",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "remind_me_server_status",
+                    "description": "Report where the data lives and what is running: database path and size, schema version against what this build expects, memory count, backup inventory, and which subsystems are active. Subsystems this crate does not implement are named with a reason rather than reported as stopped.",
+                    "inputSchema": { "type": "object", "properties": { "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." } } }
+                },
+                {
+                    "name": "remind_me_export_memories",
+                    "description": "remind-me admin: export live memories to JSON or JSONL — every column, plus the entity graph. Deleted and superseded memories are excluded unless include_deleted is set, so an export is safe to re-import. Embedding vectors are excluded as derived data. Writes to file_path when given (must be inside the allowed export roots), otherwise returns the payload inline. With template \"decisions\" and a project it instead renders that project's decision memories as a deterministic markdown decisions log (superseded ones only with include_deleted).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "format": { "type": "string", "enum": ["json", "jsonl"], "default": "json" },
+                            "category": { "type": "string", "description": "Filter: only export memories with this category" },
+                            "tags": { "type": "array", "items": { "type": "string" }, "description": "Filter: memory must have ALL of these tags" },
+                            "file_path": { "type": "string", "description": "Destination file, inside the allowed export roots. Omit to return inline." },
+                            "include_graph": { "type": "boolean", "default": true, "description": "Append entities, links and relations as record_type-tagged records" },
+                            "include_deleted": { "type": "boolean", "default": false, "description": "Include soft-deleted and superseded memories. Off by default: exported records are read back as live content, so re-importing an export that carried them would resurrect deleted and stale memories. Set only for a genuine full-backup or audit export, not for moving memories between machines." },
+                            "template": { "type": "string", "enum": ["decisions"], "description": "Render through a template instead of exporting records. decisions: the project's decision memories as a markdown log. format, category, tags and include_graph do not apply." },
+                            "project": { "type": "string", "description": "Project the template covers; required with template." }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_decompose",
+                    "description": "remind-me pipeline: break a captured conversation into individually searchable atomic facts, each linked to the capture. Write 2-5 per conversation, each self-contained for a reader with no other context: who, what, when and why, with relative dates resolved to absolute ones (2026-10-03, not 'last Friday'). Set metadata.basis: stated if someone said it, inferred if you concluded it (list the memory ids it rests on in metadata.premises). Set metadata.occurred_at (RFC 3339, or {from, to}) when the fact's event happened at another time than now. A fact whose subject/predicate match an existing fact but whose object differs supersedes it.",
+                    "inputSchema": decompose_input_schema()
+                },
+                {
+                    "name": "remind_me_decompose_batch",
+                    "description": "Fetch captures that have not been decomposed into atomic facts yet.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "batch_size": { "type": "integer", "default": 20, "minimum": DECOMPOSE_BATCH_MIN, "maximum": DECOMPOSE_BATCH_MAX },
+                            "idle_minutes": { "type": "integer", "default": 0, "minimum": 0, "maximum": u32::MAX, "description": "Only captures unchanged for at least this many minutes, so a scheduled pass leaves a live session until it settles" }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_extract_batch",
+                    "description": "Fetch memories that have no structured triple and no entity mentions yet, so they can be annotated with remind_me_annotate. Raw captured dialogs are excluded — their facts come out through remind_me_decompose instead.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "batch_size": { "type": "integer", "default": 20, "minimum": EXTRACT_BATCH_MIN, "maximum": EXTRACT_BATCH_MAX }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_auto_capture",
+                    "description": "Save a whole conversation to remind-me as two linked memories, the verbatim dialog and a concise summary; call this at the end of any substantive conversation. Write the summary to stand alone: who decided or learned what, when (absolute dates, never 'today' or 'yesterday') and why. They share a capture_id, which remind_me_get retrieves both by and remind_me_decompose breaks into atomic facts. When the conversation is about an event at another time than now, set metadata.occurred_at (RFC 3339, or {from, to}), resolving relative dates to absolute ones.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
+                            "conversation": { "type": "string", "minLength": 1, "maxLength": 500000, "description": "The verbatim exchange" },
+                            "summary": { "type": "string", "minLength": 1, "maxLength": 50000, "description": "A concise, self-contained distillation: decisions, facts and action items with absolute dates" },
+                            "title": { "type": "string", "maxLength": 200, "description": "Defaults to the summary's first line" },
+                            "tags": { "type": "array", "items": { "type": "string" }, "maxItems": 20 },
+                            "category": { "type": "string", "default": "conversation", "maxLength": 100, "description": "Category for the SUMMARY; the dialog is always stored as 'dialog'" },
+                            "metadata": { "type": "object" },
+                            "project": { "type": "string", "maxLength": 200, "description": "The project both memories belong to, e.g. a registered project name. Replaces the project detected from the writer's directory; blank is unset." }
+                        },
+                        "required": ["conversation", "summary"]
+                    }
+                },
+                {
+                    "name": "remind_me_capture_transcript",
+                    "description": "remind-me import: store or refresh a Claude Code session's capture from its raw JSONL transcript: one dialog and summary pair per session_id, replaced in place on every call. For hooks on machines without the CLI (cloud sessions); a model should use remind_me_auto_capture. The raw transcript is also archived when REMIND_ME_ARCHIVE_DIR is set.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string", "minLength": 1, "maxLength": 200 },
+                            "transcript": { "type": "string", "minLength": 1, "description": "The session's JSONL transcript so far, at most 3145728 bytes once JSON-escaped (each quote, backslash and newline counts twice); a caller over the limit sends its tail, cut at a line" },
+                            "reason": { "type": "string", "enum": ["stop", "precompact", "end"] },
+                            "project": { "type": "string", "maxLength": 200 },
+                            "git_remote": { "type": "string", "maxLength": 500 },
+                            "git_branch": { "type": "string", "maxLength": 200 },
+                            "git_sha": { "type": "string", "maxLength": 64 },
+                            "cwd": { "type": "string", "maxLength": 1000, "description": "Recorded as given; never read on this machine" }
+                        },
+                        "required": ["session_id", "transcript"]
+                    }
+                },
+                {
+                    "name": "remind_me_get_capture",
+                    "description": "Retrieve a linked dialog and summary pair by their shared capture_id.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "capture_id": { "type": "string" }
+                        },
+                        "required": ["capture_id"]
+                    }
+                },
+                {
+                    "name": "remind_me_archive_prune",
+                    "description": "remind-me admin: enforce the raw-transcript archive's retention limits (REMIND_ME_ARCHIVE_MAX_AGE_DAYS, REMIND_ME_ARCHIVE_MAX_BYTES), removing oldest-first. Runs automatically after each archived import; call it directly to reclaim space now or, with dry_run, to see what would go. Removes archives only — the memories derived from them are untouched.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "dry_run": { "type": "boolean", "default": true, "description": "Report what would be removed without removing it. Defaults to true — deletion is opt-in." }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_promotion_candidates",
+                    "description": "List what is ready to move up a rung of the refinement ladder (capture -> fact -> scenario -> persona). Each entry names the source memories, a snippet, and why it qualifies. Already-promoted sources are excluded, so re-running after promoting returns a shorter list rather than the same one. Stale scenarios and persona statements come first as `refresh` candidates with refresh_of and new_evidence.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "rung": { "type": "string", "enum": ["capture_to_fact", "fact_to_scenario", "scenario_to_persona"], "description": "capture_to_fact is reported here but promoted with remind_me_decompose." },
+                            "limit": { "type": "integer", "default": PROMOTION_LIMIT_DEFAULT, "minimum": PROMOTION_LIMIT_MIN, "maximum": PROMOTION_LIMIT_MAX }
+                        },
+                        "required": ["rung"]
+                    }
+                },
+                {
+                    "name": "remind_me_promote",
+                    "description": "remind-me pipeline: store a distillation of some memories as the rung above them, recording what it was built from. Provenance is mandatory: a promoted artifact with no sources could never be checked or demoted. Refuses capture_to_fact — that is remind_me_decompose — and refuses a sensitive source for a persona.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "rung": { "type": "string", "enum": ["fact_to_scenario", "scenario_to_persona"] },
+                            "source_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The memories this was distilled from" },
+                            "content": { "type": "string", "minLength": 1, "maxLength": 50000, "description": "The distillation" },
+                            "refreshes": { "type": "string", "description": "A refresh candidate's refresh_of: the stale promoted memory this replaces, superseded in the same write" }
+                        },
+                        "required": ["rung", "source_ids", "content"]
+                    }
+                },
+                {
+                    "name": "remind_me_stale_candidates",
+                    "description": "List memories worth re-checking: those whose content names a file (inside REMIND_ME_CODE_ROOTS) that has since changed or been deleted, and those whose valid_until has passed (reason `expired`, shown as expired_at). Read-only and never touches the memory it reports: a changed file does not prove the memory wrong, it only means the claim is worth re-checking. The file check is off -- only expired memories are listed -- unless REMIND_ME_CODE_ROOTS is configured.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "limit": { "type": "integer", "default": STALE_CANDIDATES_LIMIT_DEFAULT, "minimum": STALE_CANDIDATES_LIMIT_MIN, "maximum": STALE_CANDIDATES_LIMIT_MAX }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_persona",
+                    "description": "remind-me pipeline: the current persona: durable statements about the user whose grounds still hold. A statement whose sources have all been superseded or deleted is withheld automatically, so a contradicted fact demotes what was built on it. Set include_demoted to also see what is currently withheld and why. A statement with newer related memories says stale, with new_evidence.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "include_demoted": { "type": "boolean", "default": false, "description": "Also list statements currently withheld for lost provenance." }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_provenance",
+                    "description": "remind-me pipeline: what a memory was distilled from, and what was distilled from it. Walks the refinement ladder in both directions from one memory id.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "memory_id": { "type": "string" }
+                        },
+                        "required": ["memory_id"]
+                    }
+                },
+                references::tool_schema(),
+                {
+                    "name": "remind_me_session_timeline",
+                    "description": "remind-me extras: a client session as an episode. With session_id: the session's start and end, branch and shas, then every memory written under it (captures, facts, the work log) oldest first. Without: the most recent sessions, newest first, each with how many memories it wrote.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string", "description": "One session to read in full. Omit to list recent sessions." },
+                            "project": { "type": "string", "description": "When listing, only sessions of this project." },
+                            "limit": { "type": "integer", "minimum": 1, "default": 10, "description": "When listing, how many sessions." },
+                            "response_format": { "type": "string", "enum": ["markdown", "json"] }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_skeleton_write",
+                    "description": "remind-me pipeline: attach a Mermaid diagram of a capture's structure, so the conversation's shape can be read without reading the transcript. Each node maps to an inclusive, 1-based line range in the capture's dialog; remind_me_skeleton_read then drills into one node at a time. Ranges are validated against the dialog and the write is refused if any is out of bounds.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "capture_id": { "type": "string", "description": "The capture to describe" },
+                            "mermaid": { "type": "string", "minLength": 1, "maxLength": 100000, "description": "Mermaid source, e.g. 'graph TD\\n  n1[Ask] --> n2[Investigate]'" },
+                            "nodes": { "type": "object", "description": "Node id to [start_line, end_line], inclusive and 1-based, into the dialog. e.g. {\"n1\": [1, 12]}" }
+                        },
+                        "required": ["capture_id", "mermaid", "nodes"]
+                    }
+                },
+                {
+                    "name": "remind_me_skeleton_read",
+                    "description": "remind-me pipeline: read a capture's skeleton. Without 'node' this returns the Mermaid diagram and its node map — the cheap view of a long conversation. With 'node' it returns only that node's lines of the dialog, which is how to drill in without pulling the whole transcript.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "capture_id": { "type": "string" },
+                            "node": { "type": "string", "description": "A node id from the diagram. Omit for the diagram itself." }
+                        },
+                        "required": ["capture_id"]
+                    }
+                },
+                {
+                    "name": "remind_me_source",
+                    "description": "Retrieve the raw imported bytes a memory was derived from — the original transcript envelope, including the tool calls, reasoning blocks and session metadata that importing deliberately strips out. Only available for memories imported while REMIND_ME_ARCHIVE_DIR was set; returns nothing otherwise.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "memory_id": { "type": "string", "description": "The memory whose source to fetch" },
+                            "include_sensitive": { "type": "boolean", "default": false, "description": "Return the source even when the memory is marked sensitive. The raw source discloses more than the memory does, so this is off by default." }
+                        },
+                        "required": ["memory_id"]
+                    }
+                },
+                {
+                    "name": "remind_me_normalize_batch",
+                    "description": "Fetch raw imported memories (document/chat imports) that have not been normalized yet, so they can be distilled into a {question, summary, resolution?} shape. The raw memory is kept, not replaced.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "batch_size": { "type": "integer", "default": 20, "minimum": NORMALIZE_BATCH_MIN, "maximum": NORMALIZE_BATCH_MAX }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_api_key",
+                    "description": "remind-me admin: issue, list, or revoke named dashboard API keys with a read or read-write scope. A read-scoped key is refused on every mutating HTTP route. The plaintext key is shown exactly once, at issuance — only its hash is stored, so it can be revoked and replaced but never recovered. Not multi-tenancy: every key reads and writes the same vault, only the permitted methods differ.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "action": { "type": "string", "enum": ["issue", "list", "revoke"], "default": "list" },
+                            "name": { "type": "string", "description": "Key name; required for issue and revoke" },
+                            "scope": { "type": "string", "enum": ["read", "read-write"], "default": "read", "description": "issue only" }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_reminders_ics_url",
+                    "description": "Return the subscribable ICS calendar feed URL for reminders. Paste it into a calendar app's \"subscribe by URL\" feature to see every upcoming and overdue-undelivered reminder as an event. WARNING: the URL embeds a secret token and whoever holds it can read every reminder's content — treat it exactly like a password. Rotate by deleting the token file.",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "remind_me_set_reminder",
+                    "description": "Set a future reminder on an existing memory, or clear one already set. Pass an ISO-8601 timestamp for remind_at; omit it or pass null to clear. Naive timestamps are read as UTC. A timestamp already in the past is rejected rather than stored, because it could never fire.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
+                            "memory_id": { "type": "string", "description": "The memory to set or clear a reminder on" },
+                            "remind_at": { "type": ["string", "null"], "description": "ISO-8601 timestamp for when to surface this memory. Must be in the future. Omit or null to clear." }
+                        },
+                        "required": ["memory_id"]
+                    }
+                },
+                {
+                    "name": "remind_me_list_reminders",
+                    "description": "List memories with a reminder set, soonest first. 'upcoming' is still in the future; 'overdue' came due but has not been delivered — typically because nothing was running when it fired; 'all' is both. A delivered reminder drops out of every window.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "when": { "type": "string", "enum": ["upcoming", "overdue", "all"], "default": "upcoming" },
+                            "limit": { "type": "integer", "default": 20, "minimum": REMINDER_LIMIT_MIN, "maximum": REMINDER_LIMIT_MAX },
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown" }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_digest",
+                    "description": "A vault digest: memories added recently, and current vitality. Sensitive memories are always excluded, with no override — a digest is the ambient surface that flag exists to protect. Sections whose subsystem is not built yet are omitted rather than shown empty.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "since_days": { "type": "integer", "default": 7, "minimum": digest::DIGEST_SINCE_DAYS_MIN, "maximum": digest::DIGEST_SINCE_DAYS_MAX, "description": "How many days back counts as recent" },
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown" }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_contradiction_candidates",
+                    "description": "Surface pairs of memories that might assert incompatible things but were never caught by exact-triple supersession — two pieces of prose that conflict without either carrying a formal subject/predicate/object. Read-only: these are pairs that MIGHT conflict, and most turn out merely topically similar. Read both before acting; fix a real one with remind_me_update, remind_me_delete, or remind_me_add carrying an explicit triple. When both sides state the same subject and predicate with different objects, recommended_keep names the one to keep (higher confidence, then newer verified_at, then newer updated_at) and it is listed as memory_a. Paginate by passing the next_after_a/next_after_b from one response as after_a/after_b on the next call, and stop when has_more is false — without a cursor every call returns the same first page, so a large queue has only `limit` reachable rows.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "limit": { "type": "integer", "default": 20, "minimum": CONTRADICTION_LIMIT_MIN, "maximum": CONTRADICTION_LIMIT_MAX },
+                            "after_a": { "type": "string", "description": "Keyset cursor: next_after_a from the previous response. Must be passed together with after_b." },
+                            "after_b": { "type": "string", "description": "Keyset cursor: next_after_b from the previous response. Must be passed together with after_a." }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_history",
+                    "description": "List a memory's edit history — snapshots of its content, category, tags, metadata and sensitive flag taken before each edit replaced them. Newest first. Revision ids from here are what remind_me_revert takes.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "memory_id": { "type": "string" },
+                            "limit": { "type": "integer", "default": 10, "minimum": HISTORY_LIMIT_MIN, "maximum": HISTORY_LIMIT_MAX },
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown" }
+                        },
+                        "required": ["memory_id"]
+                    }
+                },
+                {
+                    "name": "remind_me_revert",
+                    "description": "remind-me pipeline: restore a memory's content, category, tags, metadata and sensitive flag to a prior revision. Reverting is itself an edit: it records a new revision of the state just before the revert, so a revert can be undone.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
+                            "memory_id": { "type": "string" },
+                            "revision_id": { "type": "integer", "description": "A revision id from remind_me_history for this same memory" },
+                            "reason": { "type": "string", "description": "Optional note recorded on the revision this revert creates" }
+                        },
+                        "required": ["memory_id", "revision_id"]
+                    }
+                },
+                {
+                    "name": "remind_me_save_search",
+                    "description": "Save a query and its filters under a unique name, so a recurring question does not have to be retyped. Re-saving the same name updates it in place. Set watch=true to have polling report matches that have not been seen before.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
+                            "name": { "type": "string", "description": "Unique name for this saved search" },
+                            "query": { "type": "string", "description": "The search query to store and later re-run" },
+                            "category": { "type": "string", "description": "Optional category filter" },
+                            "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional tag filter; a memory must have ALL of these" },
+                            "include_sensitive": { "type": "boolean", "default": false, "description": "Whether re-running this search includes memories marked sensitive" },
+                            "watch": { "type": "boolean", "default": false, "description": "Poll this search and report matches not seen before. Does not narrow what running it returns." }
+                        },
+                        "required": ["name", "query"]
+                    }
+                },
+                {
+                    "name": "remind_me_list_saved_searches",
+                    "description": "List every saved search, alphabetical by name, with its stored query, filters and watch flag.",
+                    "inputSchema": { "type": "object", "properties": { "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." } } }
+                },
+                {
+                    "name": "remind_me_run_saved_search",
+                    "description": "Re-run a saved search's stored query and filters. Returns all current matches — watching does not narrow this; the unseen-only diff belongs to polling.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "Name of the saved search to run" }
+                        },
+                        "required": ["name"]
+                    }
+                },
+                {
+                    "name": "remind_me_pin_saved_search",
+                    "description": "Make a saved search a pinned question: a standing answer that is flagged when it goes out of date.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "Name of the saved search to pin" }
+                        },
+                        "required": ["name"]
+                    }
+                },
+                {
+                    "name": "remind_me_answer_pinned",
+                    "description": "Record a pinned question's answer: an existing wiki page and the live memory ids it was written from. Pins the search if needed.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "Name of the saved search" },
+                            "answer_slug": { "type": "string", "description": "Slug of the wiki page holding the answer" },
+                            "evidence_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": PIN_EVIDENCE_MAX, "description": "The memories the answer was written from" },
+                            "as_of": { "type": "string", "description": "RFC 3339 time the evidence was read: checked_at from list_stale, or when you ran the search. Stamped as answered_at, capped at now; refused if the saved search changed after it; omitted means now" }
+                        },
+                        "required": ["name", "answer_slug", "evidence_ids"]
+                    }
+                },
+                {
+                    "name": "remind_me_list_stale_pinned",
+                    "description": "List pinned questions whose answer is out of date, with checked_at (pass it to answer as as_of), each with its reasons, up to 5 new memory ids to read before answering again, and any evidence ids now deleted or superseded.",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "remind_me_delete_saved_search",
+                    "description": "Delete a saved search by name, along with the seen-memory rows its watch tracking accumulated.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "Name of the saved search to delete" }
+                        },
+                        "required": ["name"]
+                    }
+                },
+                {
+                    "name": "remind_me_undo_import",
+                    "description": "remind-me import: roll back a previous import, removing its memories and its tracking rows. Defaults to a dry run — pass dry_run=false to actually delete. On a sync-enabled node this soft-deletes: a tombstone without the memory's text stays, so the removal propagates to every other node. Resumable: call again until 'remaining' is 0.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "import_kind": { "type": "string", "enum": ["chat", "dbs", "mempalace"], "description": "Which import to undo" },
+                            "import_id": { "type": "string", "description": "Scope to one import run. For 'chat' the chat_imports import_id; for 'dbs' the dbs_source; for 'mempalace' a drawer_id prefix. Omit to target every record of that kind." },
+                            "dry_run": { "type": "boolean", "default": true, "description": "When true (the default), report what would be removed and change nothing." },
+                            "limit": { "type": "integer", "default": 500, "minimum": UNDO_IMPORT_LIMIT_MIN, "maximum": UNDO_IMPORT_LIMIT_MAX, "description": "Maximum memories to remove per call. Work is resumable." }
+                        },
+                        "required": ["import_kind"]
+                    }
+                },
+                {
+                    "name": "remind_me_recalibrate_candidates",
+                    "description": "Fetch memories whose importance classification may be stale: they look important (high base_weight, or a durable memory_type like decision/fact) yet have gone untouched for 90+ days and have never received feedback. Read-only — review each and apply changes with remind_me_reclassify (a type change) or remind_me_feedback (a pure importance nudge). Most candidates will look fine; this only narrows an unbounded set to a reviewable batch.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "limit": { "type": "integer", "default": 20, "minimum": RECALIBRATE_LIMIT_MIN, "maximum": RECALIBRATE_LIMIT_MAX, "description": "Number of importance-review candidates to return" }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_normalize_apply",
+                    "description": "remind-me pipeline: write distilled normalizations back as new memories, each linked to the raw import it came from via a normalized_from metadata pointer. The raw memory is left untouched.",
+                    "inputSchema": normalize_apply_input_schema()
+                },
+                {
+                    "name": "remind_me_entity_traverse",
+                    "description": "remind-me pipeline: multi-hop traversal of the typed entity-relation graph from a starting entity. Unlike remind_me_entity (one entity's direct facts) this follows entity_relations edges in both directions, so it answers questions that chain relations rather than co-mention.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "Entity name or alias to start from (case/whitespace-insensitive)", "minLength": 1, "maxLength": 200 },
+                            "hops": { "type": "integer", "default": 1, "minimum": 1, "maximum": 3, "description": "Maximum traversal depth. 1 = direct relations only." },
+                            "relation": { "type": "string", "maxLength": 200, "description": "Optional: only follow edges whose relation label matches exactly" },
+                            "cap": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100, "description": "Max number of relation edges to return" }
+                        },
+                        "required": ["name"]
+                    }
+                },
+                {
+                    "name": "remind_me_wiki_write",
+                    "description": "remind-me wiki: write or update a markdown wiki page.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "title": { "type": "string", "minLength": 1, "maxLength": 200, "description": "The title's slug is the page's identity — keep titles stable so [[wikilinks]] resolve" },
+                            "content": { "type": "string", "minLength": 1, "maxLength": 100000, "description": "Full markdown body, REPLACING any existing content. Open with a one-sentence summary; it becomes the index entry. A leading '# Title' is added if absent." },
+                            "log_note": { "type": "string", "maxLength": 500, "description": "Optional note recorded in log.md alongside the change" }
+                        },
+                        "required": ["title", "content"]
+                    }
+                },
+                {
+                    "name": "remind_me_wiki_read",
+                    "description": "Read a wiki page by slug. stale and new_evidence say whether newer memories share an entity with the ids it cites (null: it cites none).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
+                            "slug": { "type": "string" }
+                        },
+                        "required": ["slug"]
+                    }
+                },
+                {
+                    "name": "remind_me_wiki_import",
+                    "description": "Import a directory of Markdown files into the wiki. Each file's slug/title/topic come from its YAML front matter, falling back to its first '# ' heading then its filename. Idempotent - pages upsert on slug. Pairs with `dbs export-wiki --out-dir` from daily-backup-system.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "dir": { "type": "string" },
+                            "recursive": { "type": "boolean", "default": true }
+                        },
+                        "required": ["dir"]
+                    }
+                },
+                {
+                    "name": "remind_me_reclassify",
+                    "description": "remind-me pipeline: apply memory_type classifications. Updates each memory's decay rate to match its new type.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "classifications": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 100,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "memory_id": { "type": "string" },
+                                        "memory_type": { "type": "string" }
+                                    },
+                                    "required": ["memory_id", "memory_type"]
+                                }
+                            }
+                        },
+                        "required": ["classifications"]
+                    }
+                },
+                {
+                    "name": "remind_me_reclassify_batch",
+                    "description": "Fetch a batch of still-unclassified memories, with content snippets, to classify and feed back through remind_me_reclassify.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "batch_size": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_feedback",
+                    "description": "remind-me pipeline: mark a memory helpful or unhelpful. Without `query` this is a global judgement that adjusts the memory's weight; with `query` it is recorded as feedback for similar future searches only.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "memory_id": { "type": "string" },
+                            "signal": { "type": "string", "enum": ["helpful", "unhelpful"] },
+                            "query": { "type": "string", "maxLength": 500 }
+                        },
+                        "required": ["memory_id", "signal"]
+                    }
+                },
+                {
+                    "name": "remind_me_backup",
+                    "description": "remind-me admin: create a WAL-safe online backup of the memory database, beside the database file. Older backups beyond the retention count are pruned.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "remind_me_annotate",
+                    "description": "remind-me pipeline: apply subject/predicate/object triples and entity mentions to existing memories, in batches of up to 100.",
+                    "inputSchema": annotate_input_schema()
+                },
+                {
+                    "name": "remind_me_vitality_report",
+                    "description": "Vault health report: active/dormant counts, average vitality, distribution buckets, and a breakdown by category.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default, as the reference) returns the structured report; markdown renders it for reading." }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_wiki_load",
+                    "description": "Load the whole wiki into context as one markdown document, newest-revised first up to a token budget. Overflow is listed by title so it can be read individually.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "token_budget": { "type": "integer", "default": 0, "minimum": 0, "maximum": 200000, "description": "0 means unlimited" },
+                            "include_index": { "type": "boolean", "default": true }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_wiki_compile",
+                    "description": "remind-me wiki: drive wiki synthesis over raw memories. With mark_integrated=false (the default) returns a brief of pending sources and never advances the watermark, so it is safe to call repeatedly. Call again with mark_integrated=true and the brief's `through` after writing the pages, so exactly that brief's sources are marked. With auto=true the server's own local model (REMIND_ME_WIKI_LLM_URL and _MODEL) writes the pages and marks each batch itself; this can take minutes per batch.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
+                            "limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
+                            "mark_integrated": { "type": "boolean", "default": false },
+                            "through": { "type": "string", "description": "With mark_integrated=true: the `through` a brief returned. Marks exactly that brief's sources. Without it the batch is recomputed, which an edit in between can change." },
+                            "auto": { "type": "boolean", "default": false, "description": "Have the configured local model write the pages. Ignores limit, mark_integrated and through." },
+                            "max_batches": { "type": "integer", "default": 1, "minimum": 1, "maximum": 20, "description": "With auto=true: batches to compile before returning." },
+                            "allow_shrink": { "type": "boolean", "default": false, "description": "With auto=true: accept a rewrite that shortens a page below 95% or drops one of its [[links]], headings or `backticked` details." }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_wiki_search",
+                    "description": "Full-text search wiki page titles and content, ranked by BM25.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string", "minLength": 1, "maxLength": 500 },
+                            "limit": { "type": "integer", "default": 10, "minimum": 1, "maximum": 50 }
+                        },
+                        "required": ["query"]
+                    }
+                },
+                {
+                    "name": "remind_me_wiki_list",
+                    "description": "List every wiki page, most recently updated first.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown", "description": "markdown (default, as the reference) renders the wiki index; json returns count and pages." },}
+                    }
+                },
+                {
+                    "name": "remind_me_wiki_delete",
+                    "description": "remind-me wiki: delete a wiki page by title or slug.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "title": {
+                                "type": "string",
+                                "description": "Page title or slug",
+                                "minLength": 1,
+                                "maxLength": 200
+                            }
+                        },
+                        "required": ["title"]
+                    }
+                },
+                {
+                    "name": "remind_me_consolidate",
+                    "description": "remind-me pipeline: find clusters of near-duplicate memories by embedding similarity and optionally merge them into one canonical representative. dry_run (default true) reports clusters — canonical, members, and each member's similarity to the canonical — without changing anything. To actually merge, review the report, write a short summary per cluster you want consolidated, then call again with dry_run=false and summaries={canonical_id: summary}; a cluster with no matching summary is skipped, not merged with a raw concatenation.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "similarity_threshold": { "type": "number", "default": 0.85, "minimum": CONSOLIDATE_SIMILARITY_MIN, "maximum": CONSOLIDATE_SIMILARITY_MAX, "description": "Minimum cosine similarity to cluster memories together. Higher = stricter." },
+                            "dry_run": { "type": "boolean", "default": true, "description": "If true, report clusters without modifying data. Set false to auto-merge." },
+                            "category": { "type": "string", "description": "Limit consolidation to this category" },
+                            "limit": { "type": "integer", "default": 500, "minimum": CONSOLIDATE_LIMIT_MIN, "maximum": CONSOLIDATE_LIMIT_MAX, "description": "Maximum memories to consider (prevents runaway on large vaults)" },
+                            "summaries": { "type": "object", "additionalProperties": { "type": "string" }, "description": "{canonical_id: summary}, one entry per cluster (from a prior dry_run=true call) you want consolidated. Required to actually merge a cluster when dry_run=false." }
+                        }
+                    }
+                },
+                {
+                    "name": "remind_me_resolve",
+                    "description": "Close a remind-me decision or action item with `outcome`: done, abandoned, reverted, superseded, or carded (moved to a board card, so no longer open but not done). Or record a decision's follow-up review with `review`: whether it held up, which is separate from whether it was carried out. Pass exactly one. A reverted or abandoned one loses half its weight so it stops outranking what replaced it; the prior state is kept in history.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "memory_id": { "type": "string" },
+                            "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded", "carded"] },
+                            "review": { "type": "string", "enum": ["held", "revised", "reverted"], "description": "Decisions only. `reverted` also sets outcome to reverted." },
+                            "note": { "type": "string", "description": "Why; stored as metadata.outcome_note, or metadata.review.note for a review." }
+                        },
+                        "required": ["memory_id"]
+                    }
+                },
+                {
+                    "name": "remind_me_stats",
+                    "description": "Get database stats and memory counts.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown" }
+                        }
+                    }
+                }
+            ]
+        }
+    })
+}
+
 /// Something that answers MCP JSON-RPC lines: this process's own
 /// [`McpServer`], or [`daemon_proxy::DaemonProxy`] relaying to the daemon's.
 pub trait Handler: Send + Sync {
@@ -3791,8 +3860,18 @@ fn contract_error(code: &str, message: &str, fix: &str, extra: Value) -> Value {
     json!({ "isError": true, "content": [{ "type": "text", "text": body.to_string() }] })
 }
 
-/// `remind_me_brief`: validate at the boundary, build, render.
-fn brief_tool(store: &remind_me_core::db::Store<'_>, args: Value) -> Value {
+/// `remind_me_brief`: validate at the boundary, build, render. A caller that
+/// sends no `token_budget` gets its registry `brief_budget` (ADR-0028 §2).
+fn brief_tool(store: &remind_me_core::db::Store<'_>, mut args: Value) -> Value {
+    if let Some(map) = args.as_object_mut() {
+        if !map.contains_key("token_budget") {
+            if let Some(budget) =
+                remind_me_core::clients::current_entry().and_then(|e| e.brief_budget)
+            {
+                map.insert("token_budget".to_string(), json!(budget));
+            }
+        }
+    }
     let input: BriefInput = match serde_json::from_value(args) {
         Ok(input) => input,
         Err(e) => {

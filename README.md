@@ -131,8 +131,20 @@ pick up a new stdio server until it restarts.
 The default is `core`. Set a comma list such as
 `REMIND_ME_TOOL_PROFILE=core,wiki`; `full` is every group and `standard` is
 `core,pipeline,wiki`. To get the old surface back, set
-`REMIND_ME_TOOL_PROFILE=full`. Small local models do best on plain `core`. Tool names merged away in 0.5 still work
+`REMIND_ME_TOOL_PROFILE=full`. Small local models get `minimal`: only
+search, get, add, auto_capture and brief (`minimal,wiki` adds a group;
+`minimal,core` is `core`). Tool names merged away in 0.5 still work
 until 0.6.0 but are no longer listed.
+
+A client registered in `clients.json` (`REMIND_ME_CLIENTS_FILE`) can carry its
+own `profile`, `format` (the default `response_format` on every tool that takes
+one) and `brief_budget` (`remind_me_brief`'s default `token_budget`). Those beat
+`REMIND_ME_TOOL_PROFILE` and `REMIND_ME_DEFAULT_RESPONSE_FORMAT`, per caller,
+including over the remote connector:
+
+```json
+{ "hermes-jarvis": { "profile": "minimal", "format": "json", "brief_budget": 600 } }
+```
 
 ### 3. Verify end to end
 

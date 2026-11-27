@@ -1,7 +1,10 @@
 # ADR-0030: Tool groups and a ten-tool core
 
 Status: Accepted (2026-10-26); step 1 implemented. Drafted as ADR-0027, renumbered
-when the projects ADR took that number.
+when the projects ADR took that number. Amended 2026-11-27 (#1552, D111): the
+`minimal` preset (ADR-0028 §2) is the one exception to "core is always on"; it is
+a preset beside `full` and `standard`, not a group, so every tool stays in exactly
+one group.
 Date: 2026-10-26
 
 ## Context

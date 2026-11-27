@@ -32,8 +32,20 @@ use std::collections::BTreeSet;
 pub const TOOL_PROFILE_ENV: &str = "REMIND_ME_TOOL_PROFILE";
 
 /// Profile names that are not a group: `full` is every group, `standard` is
-/// `core,pipeline,wiki` (what it covered before groups existed).
-pub const PRESETS: [&str; 2] = ["full", "standard"];
+/// `core,pipeline,wiki` (what it covered before groups existed), `minimal`
+/// is [`MINIMAL`] (ADR-0028 §2).
+pub const PRESETS: [&str; 3] = ["full", "standard", "minimal"];
+
+/// The five tools a small local model gets (ADR-0028 §2): the one profile
+/// narrower than [`CORE`]. Groups added to it (`minimal,wiki`) are opt-in;
+/// `minimal,core` is `core`.
+pub const MINIMAL: [&str; 5] = [
+    "remind_me_search",
+    "remind_me_get",
+    "remind_me_add",
+    "remind_me_auto_capture",
+    "remind_me_brief",
+];
 
 /// What an ordinary session reaches for.
 ///
@@ -192,15 +204,14 @@ pub fn group_of(tool: &str) -> Option<&'static str> {
 /// The profile a client gets when it sets none (ADR-0030 step 2; `full` before).
 pub const DEFAULT_PROFILE: &str = "core";
 
-/// The configured profile, normalised: [`DEFAULT_PROFILE`] when unset or
-/// blank, `full` on anything unrecognised.
-///
-/// A profile is `full`, `standard`, or a comma list of [`GROUPS`] names such
-/// as `core,wiki`. A typo yields the *widest* surface rather than an error or
-/// an empty one: failing to start over a misspelled optimisation would be
-/// worse than the misspelling, and an empty surface would look like a broken
-/// server.
+/// The profile in force for the current caller, normalised: the client
+/// registry's `profile` for the resolved client (ADR-0028 §2, per caller),
+/// else [`TOOL_PROFILE_ENV`], else [`DEFAULT_PROFILE`]. An unrecognised
+/// [`TOOL_PROFILE_ENV`] is `full`.
 pub fn configured_profile() -> String {
+    if let Some(profile) = crate::clients::current_entry().and_then(|entry| entry.profile) {
+        return profile;
+    }
     // Per session: on the daemon, each client keeps its own profile.
     let raw = crate::daemon::session::var(TOOL_PROFILE_ENV).unwrap_or_default();
     normalise(&raw).unwrap_or_else(|| {
@@ -217,7 +228,13 @@ pub fn configured_profile() -> String {
 
 /// `raw` lowercased with blanks removed, or `None` when a part is unknown.
 /// Unset or blank is [`DEFAULT_PROFILE`].
-fn normalise(raw: &str) -> Option<String> {
+///
+/// A profile is `full`, `standard`, `minimal`, or a comma list of
+/// [`GROUPS`] names such as `core,wiki` (and `minimal,wiki`). A typo in the
+/// environment yields the *widest* surface rather than an error or an empty
+/// one ([`configured_profile`]); in the client registry it makes the file
+/// unusable, with the reason.
+pub fn normalise(raw: &str) -> Option<String> {
     let parts: Vec<String> = raw
         .split(',')
         .map(|p| p.trim().to_ascii_lowercase())
@@ -234,14 +251,17 @@ fn group_names() -> Vec<&'static str> {
     GROUPS.iter().map(|(group, _)| *group).collect()
 }
 
-/// The groups `profile` turns on, or `None` when it is `full`. Core is always
-/// on: a profile without search and add is not a narrower memory, it is none.
+/// The groups `profile` turns on, or `None` when it is `full`. Core is on
+/// unless the profile is `minimal` without `core`: a profile without search
+/// and add is not a narrower memory, it is none, and `minimal` keeps both.
 pub fn allowed_groups(profile: &str) -> Option<BTreeSet<&'static str>> {
-    let mut groups = BTreeSet::from(["core"]);
+    let mut groups = BTreeSet::new();
+    let mut minimal = false;
     for part in profile.split(',').map(str::trim) {
         match part {
             "full" => return None,
-            "standard" => groups.extend(["pipeline", "wiki"]),
+            "standard" => groups.extend(["core", "pipeline", "wiki"]),
+            "minimal" => minimal = true,
             other => {
                 if let Some(group) = group_names().into_iter().find(|g| *g == other) {
                     groups.insert(group);
@@ -249,28 +269,31 @@ pub fn allowed_groups(profile: &str) -> Option<BTreeSet<&'static str>> {
             }
         }
     }
+    if !minimal {
+        groups.insert("core");
+    }
     Some(groups)
 }
 
 /// Public tool names `profile` advertises, or `None` when everything is.
 pub fn allowed_tools(profile: &str) -> Option<BTreeSet<&'static str>> {
     let groups = allowed_groups(profile)?;
-    Some(
-        GROUPS
-            .iter()
-            .filter(|(group, _)| groups.contains(group))
-            .flat_map(|(_, tools)| tools.iter().copied())
-            .collect(),
-    )
+    let mut tools: BTreeSet<&'static str> = GROUPS
+        .iter()
+        .filter(|(group, _)| groups.contains(group))
+        .flat_map(|(_, tools)| tools.iter().copied())
+        .collect();
+    if !groups.contains("core") {
+        tools.extend(MINIMAL);
+    }
+    Some(tools)
 }
 
 /// Whether `tool` (a public name or an alias) is callable under `profile`.
+/// An alias is allowed exactly when its replacement is.
 pub fn tool_allowed(profile: &str, tool: &str) -> bool {
-    match (allowed_groups(profile), group_of(tool)) {
-        (None, _) => true,
-        (Some(groups), Some(group)) => groups.contains(group),
-        (Some(_), None) => false,
-    }
+    let public = replacement(tool).unwrap_or(tool);
+    allowed_tools(profile).is_none_or(|tools| tools.contains(public))
 }
 
 /// Whether `prompt` is offered under `profile`.
