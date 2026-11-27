@@ -11,8 +11,12 @@
 //!   with no span is counted, not a finding;
 //! - store: a replayed row the dialog store holds has the same hash there;
 //!   one it lacks is counted;
-//! - skeletons: every node range still addresses the capture's dialog;
-//! - links: every derived memory's `capture_id` names a live dialog.
+//! - skeletons: every node range still addresses the capture's dialog,
+//!   rebuilt from the replayed rows when all of them replayed, else the
+//!   live rows; the report counts each kind;
+//! - links: every derived memory's `capture_id` names a live dialog. A
+//!   memory linked only through `source_capture_id` (a fact decomposed from
+//!   a capture) is not validated here; the report counts those links.
 //!
 //! Replay reads `REMIND_ME_REDACT` and `REMIND_ME_MESSAGE_TOOLS` as they are
 //! now; no row records their value at capture (Q36), so the report names
@@ -64,8 +68,16 @@ pub struct Report {
     /// Replayed rows whose canonical hash differs from the dialog store's.
     pub store_drift: Vec<String>,
     pub bad_skeleton: Vec<String>,
+    /// Skeletons checked against the replayed dialog.
+    pub skeletons_replayed: u64,
+    /// Skeletons checked against the live rows only, because some row of
+    /// their capture was not replayed: unverified by replay.
+    pub skeletons_live_only: u64,
     /// Derived memories whose `capture_id` names no live dialog.
     pub orphaned: Vec<String>,
+    /// Memories that name a capture through `source_capture_id`. Counted,
+    /// not validated: this check covers `capture_id` links only.
+    pub source_capture_links_unchecked: u64,
 }
 
 impl Report {
@@ -168,6 +180,10 @@ fn rebuild(store: &Store<'_>, scratch: &Path) -> Result<Report> {
         BlobStore::new(scratch.join("blobs")),
     );
     let tools = MessageTools::from_env();
+    // Replayed bodies are kept only for captures with a skeleton, to check
+    // its ranges against them.
+    let sketched = skeleton_captures(&derived);
+    let mut kept: HashMap<String, String> = HashMap::new();
     for m in &dialogs {
         report.dialogs += 1;
         if !redaction_stable(&m.content) {
@@ -177,6 +193,12 @@ fn rebuild(store: &Store<'_>, scratch: &Path) -> Result<Report> {
             Replay::Body(body) => {
                 report.replayed += 1;
                 log.record(&replayed_row(m, &body))?;
+                if m.capture_id
+                    .as_deref()
+                    .is_some_and(|c| sketched.contains(c))
+                {
+                    kept.insert(m.id.clone(), body);
+                }
             }
             Replay::NoSource => report.not_replayable += 1,
             Replay::CutAfterRedaction => report.cut_after_redaction += 1,
@@ -184,8 +206,12 @@ fn rebuild(store: &Store<'_>, scratch: &Path) -> Result<Report> {
         }
     }
     compare(&mut report, log.store(), &dialogs, &stored_hashes(store)?)?;
-    report.bad_skeleton = bad_skeletons(store, &derived)?;
+    check_skeletons(&mut report, store, &sketched, &kept)?;
     report.orphaned = orphans(&dialogs, &derived);
+    report.source_capture_links_unchecked = derived
+        .iter()
+        .filter(|m| m.source_capture_id.is_some())
+        .count() as u64;
     Ok(report)
 }
 
@@ -275,24 +301,41 @@ fn compare(
     })
 }
 
-/// Captures whose skeleton has a node outside its dialog.
-fn bad_skeletons(store: &Store<'_>, derived: &[Memory]) -> Result<Vec<String>> {
-    let captures: BTreeSet<&str> = derived
+/// Captures that have a skeleton.
+fn skeleton_captures(derived: &[Memory]) -> BTreeSet<String> {
+    derived
         .iter()
         .filter(|m| m.category == SKELETON_CATEGORY)
-        .filter_map(|m| m.capture_id.as_deref())
-        .collect();
-    let mut bad = Vec::new();
+        .filter_map(|m| m.capture_id.clone())
+        .collect()
+}
+
+/// Check each skeleton's ranges, against the replayed dialog where `kept`
+/// holds every row of it.
+fn check_skeletons(
+    report: &mut Report,
+    store: &Store<'_>,
+    captures: &BTreeSet<String>,
+    kept: &HashMap<String, String>,
+) -> Result<()> {
     for capture in captures {
-        let holds = crate::skeleton::ranges_hold(store, capture).map_err(|e| match e {
-            crate::skeleton::SkeletonError::Db(e) => e,
-            other => StoreError::Engine(format!("skeleton of {capture}: {other}")),
-        })?;
-        if !holds {
-            bad.push(capture.to_string());
+        let checked =
+            crate::skeleton::check_rebuilt(store, capture, kept).map_err(|e| match e {
+                crate::skeleton::SkeletonError::Db(e) => e,
+                other => StoreError::Engine(format!("skeleton of {capture}: {other}")),
+            })?;
+        let Some(checked) = checked else {
+            continue;
+        };
+        match checked.replayed {
+            true => report.skeletons_replayed += 1,
+            false => report.skeletons_live_only += 1,
+        }
+        if !checked.holds {
+            report.bad_skeleton.push(capture.clone());
         }
     }
-    Ok(bad)
+    Ok(())
 }
 
 /// Derived memories whose `capture_id` names no live dialog.
