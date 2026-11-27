@@ -1,0 +1,266 @@
+//! Rebuild check for the dialog store (#528, D133). Read only.
+//!
+//! Replays every live `memories` dialog row (the record, D82) from what the
+//! store keeps into a scratch dialog store, then compares. Deterministic
+//! stages only; model-written extraction comes in a later slice.
+//!
+//! - redaction: a stored body scrubs to itself;
+//! - replay: a row with an archived source span re-renders, through the
+//!   capture's own render and scrub, to its stored body, so its scratch row
+//!   (live id and capture id kept) has the live canonical hash (D77). A row
+//!   with no span is counted, not a finding;
+//! - store: a replayed row the dialog store holds has the same hash there;
+//!   one it lacks is counted;
+//! - skeletons: every node range still addresses the capture's dialog;
+//! - links: every derived memory's `capture_id` names a live dialog.
+//!
+//! Replay reads `REMIND_ME_REDACT` and `REMIND_ME_MESSAGE_TOOLS` as they are
+//! now; no row records their value at capture (Q36), so the report names
+//! both.
+
+use crate::blobs::BlobStore;
+use crate::db::dialogs::{DialogLog, DialogStore, NewDialog};
+use crate::db::memories::Memories;
+use crate::db::sqlite::SqliteDialogs;
+use crate::db::{Result, Store, StoreError};
+use crate::dialog_reconcile::{as_record, store_file};
+use crate::models::{Memory, CONTINUATION_TYPE, DIALOG_CATEGORY, SKELETON_CATEGORY};
+use crate::transcript::{MessageTools, MESSAGE_TOOLS_ENV};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+/// What [`check`] found. Lists hold memory ids, except `bad_skeleton`
+/// (capture ids).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Report {
+    /// The scratch directory the rows were rebuilt into.
+    pub scratch: PathBuf,
+    /// Whether `scratch` was left on disk.
+    pub kept: bool,
+    /// `REMIND_ME_REDACT` is not `0`.
+    pub redact: bool,
+    /// `REMIND_ME_MESSAGE_TOOLS` as set (`None`: unset, the defaults).
+    pub message_tools: Option<String>,
+    /// Live `memories` dialog rows.
+    pub dialogs: u64,
+    pub replayed: u64,
+    /// Rows with no archived source span.
+    pub not_replayable: u64,
+    /// Replayed rows the dialog store does not hold.
+    pub not_in_store: u64,
+    /// Bodies that a scrub would still change.
+    pub unstable_redaction: Vec<String>,
+    /// Replayed rows whose canonical hash differs from the live row's.
+    pub replay_mismatch: Vec<String>,
+    /// Replayed rows whose canonical hash differs from the dialog store's.
+    pub store_drift: Vec<String>,
+    pub bad_skeleton: Vec<String>,
+    /// Derived memories whose `capture_id` names no live dialog.
+    pub orphaned: Vec<String>,
+}
+
+impl Report {
+    /// Problems found; the counts are not.
+    pub fn findings(&self) -> usize {
+        self.unstable_redaction.len()
+            + self.replay_mismatch.len()
+            + self.store_drift.len()
+            + self.bad_skeleton.len()
+            + self.orphaned.len()
+    }
+}
+
+/// A fresh `rebuild-check-<time>` directory beside `store`'s database;
+/// `None` for an in-memory database.
+pub fn default_scratch(store: &Store<'_>) -> Option<PathBuf> {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
+    Some(
+        store
+            .path()?
+            .parent()?
+            .join(format!("rebuild-check-{stamp}")),
+    )
+}
+
+/// Run the check with `scratch`, or [`default_scratch`]. The scratch is
+/// removed afterwards unless `keep` is set or something was found; an
+/// error leaves it for inspection.
+///
+/// # Errors
+///
+/// [`StoreError`] if `scratch` exists or cannot be made, or a store cannot
+/// be read.
+pub fn check(store: &Store<'_>, scratch: Option<&Path>, keep: bool) -> Result<Report> {
+    let scratch = match scratch {
+        Some(dir) => dir.to_path_buf(),
+        None => default_scratch(store).ok_or_else(|| {
+            StoreError::Engine("an in-memory database needs an explicit scratch".into())
+        })?,
+    };
+    // Never into an existing directory: its rows would mix with the replay.
+    std::fs::create_dir(&scratch)
+        .map_err(|e| StoreError::Engine(format!("scratch {}: {e}", scratch.display())))?;
+    let mut report = rebuild(store, &scratch)?;
+    report.kept = keep || report.findings() > 0;
+    if !report.kept {
+        if let Err(e) = std::fs::remove_dir_all(&scratch) {
+            eprintln!(
+                "rusty-remind-me: scratch {} not removed: {e}",
+                scratch.display()
+            );
+            report.kept = true;
+        }
+    }
+    Ok(report)
+}
+
+fn rebuild(store: &Store<'_>, scratch: &Path) -> Result<Report> {
+    let message_tools = std::env::var(MESSAGE_TOOLS_ENV).ok();
+    let mut report = Report {
+        scratch: scratch.to_path_buf(),
+        redact: crate::redact::enabled_by_env(),
+        message_tools,
+        ..Report::default()
+    };
+    let (dialogs, derived): (Vec<Memory>, Vec<Memory>) = Memories::new(store)
+        .all_live()?
+        .into_iter()
+        .partition(|m| m.category == DIALOG_CATEGORY);
+    let mut log = DialogLog::new(
+        SqliteDialogs::open(scratch)?,
+        BlobStore::new(scratch.join("blobs")),
+    );
+    let tools = MessageTools::from_env();
+    for m in &dialogs {
+        report.dialogs += 1;
+        if !redaction_stable(&m.content) {
+            report.unstable_redaction.push(m.id.clone());
+        }
+        match replay(store, m, &tools)? {
+            Some(body) => {
+                report.replayed += 1;
+                log.record(&replayed_row(m, &body))?;
+            }
+            None => report.not_replayable += 1,
+        }
+    }
+    compare(&mut report, log.store(), &dialogs, &stored_hashes(store)?)?;
+    report.bad_skeleton = bad_skeletons(store, &derived)?;
+    report.orphaned = orphans(&dialogs, &derived);
+    Ok(report)
+}
+
+/// Whether scrubbing `body` again leaves it as it is.
+fn redaction_stable(body: &str) -> bool {
+    let (mut tags, mut metadata) = (Vec::new(), serde_json::json!({}));
+    crate::boundary::scrub(body, &mut tags, &mut metadata) == body
+}
+
+/// `m`'s body rebuilt from its archived span; `None` with no span or no
+/// capture id.
+fn replay(store: &Store<'_>, m: &Memory, tools: &MessageTools) -> Result<Option<String>> {
+    if m.capture_id.is_none() {
+        return Ok(None);
+    }
+    let Some(bytes) = crate::archive::span_bytes(store, &m.id)
+        .map_err(|e| StoreError::Engine(format!("source of {}: {e}", m.id)))?
+    else {
+        return Ok(None);
+    };
+    let continuation =
+        m.metadata.get("type").and_then(serde_json::Value::as_str) == Some(CONTINUATION_TYPE);
+    let span = String::from_utf8_lossy(&bytes);
+    Ok(Some(crate::transcript::replay_row(
+        &span,
+        continuation,
+        tools,
+    )))
+}
+
+/// The scratch row for `m`: its own fields, the replayed body.
+fn replayed_row<'a>(m: &'a Memory, body: &'a str) -> NewDialog<'a> {
+    NewDialog {
+        id: &m.id,
+        capture_id: m.capture_id.as_deref().unwrap_or_default(),
+        session_id: m.session_id.as_deref(),
+        project: m.project.as_deref(),
+        created_at: &m.created_at,
+        body,
+    }
+}
+
+/// Canonical hash of each row in the dialog store beside `store`, if any.
+fn stored_hashes(store: &Store<'_>) -> Result<HashMap<String, String>> {
+    let mut hashes = HashMap::new();
+    let Some(file) = store_file(store) else {
+        return Ok(hashes);
+    };
+    SqliteDialogs::open_read_only(&file)?.scan(&mut |r| {
+        hashes.insert(r.id.clone(), r.canonical_hash());
+        Ok(())
+    })?;
+    Ok(hashes)
+}
+
+/// Compare each scratch row with its live row and its stored row.
+fn compare(
+    report: &mut Report,
+    scratch: &SqliteDialogs,
+    dialogs: &[Memory],
+    stored: &HashMap<String, String>,
+) -> Result<()> {
+    let live: HashMap<&str, String> = dialogs
+        .iter()
+        .map(|m| (m.id.as_str(), as_record(m).canonical_hash()))
+        .collect();
+    scratch.scan(&mut |r| {
+        let hash = r.canonical_hash();
+        if live.get(r.id.as_str()) != Some(&hash) {
+            report.replay_mismatch.push(r.id.clone());
+        }
+        match stored.get(&r.id) {
+            None => report.not_in_store += 1,
+            Some(h) if *h != hash => report.store_drift.push(r.id.clone()),
+            Some(_) => {}
+        }
+        Ok(())
+    })
+}
+
+/// Captures whose skeleton has a node outside its dialog.
+fn bad_skeletons(store: &Store<'_>, derived: &[Memory]) -> Result<Vec<String>> {
+    let captures: BTreeSet<&str> = derived
+        .iter()
+        .filter(|m| m.category == SKELETON_CATEGORY)
+        .filter_map(|m| m.capture_id.as_deref())
+        .collect();
+    let mut bad = Vec::new();
+    for capture in captures {
+        let holds = crate::skeleton::ranges_hold(store, capture).map_err(|e| match e {
+            crate::skeleton::SkeletonError::Db(e) => e,
+            other => StoreError::Engine(format!("skeleton of {capture}: {other}")),
+        })?;
+        if !holds {
+            bad.push(capture.to_string());
+        }
+    }
+    Ok(bad)
+}
+
+/// Derived memories whose `capture_id` names no live dialog.
+fn orphans(dialogs: &[Memory], derived: &[Memory]) -> Vec<String> {
+    let captures: HashSet<&str> = dialogs
+        .iter()
+        .filter_map(|m| m.capture_id.as_deref())
+        .collect();
+    derived
+        .iter()
+        .filter(|m| {
+            m.capture_id
+                .as_deref()
+                .is_some_and(|c| !captures.contains(c))
+        })
+        .map(|m| m.id.clone())
+        .collect()
+}

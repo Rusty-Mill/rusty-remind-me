@@ -2,6 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-27 — Dialog rebuild check (Mill Board #528, D133)
+
+### Added
+- `dialog_rebuild::check`: replays every live `memories` dialog row into a scratch dialog store and compares, read only. A row with an archived source span re-renders through the capture's own render, cut and scrub; its scratch row keeps the live id and capture id and must have the live canonical hash (D77). Rows with no span are counted as `not_replayable`. A replayed row the dialog store holds must hash the same there; one it lacks is counted. It also lists bodies a second scrub would change, skeletons with a node outside their dialog (by `write_skeleton`'s own range check), and derived memories whose `capture_id` names no live dialog.
+- The report names `REMIND_ME_REDACT` and `REMIND_ME_MESSAGE_TOOLS` as they are now, since no row records them at capture (Q36).
+- `rusty-remind-me dialogs rebuild-check [--scratch DIR] [--keep]`: the scratch defaults to a fresh `rebuild-check-<time>` directory beside the database and is removed afterwards unless `--keep` is given or there are findings. An existing directory is refused. Prints JSON and exits 1 on findings.
+- `docs/handoff`: D133 (this slice's shape) and Q36.
+
+### Tests
+- A first row with a redacted card number, its continuation and a skeleton replay clean, with a plain capture counted as not replayable; a transcript cut to `MAX_DIALOG_CHARS` replays with its cut; a changed `REMIND_ME_MESSAGE_TOOLS` is a mismatch, named, and keeps the scratch; an existing scratch is refused; CLI argument parsing.
+
 ## 2026-11-27 — Dialog store check on open (Mill Board #528, D132)
 
 ### Added

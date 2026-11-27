@@ -314,6 +314,31 @@ pub fn source_for(
     }))
 }
 
+/// The whole span recorded for `memory_id`, uncut, or `None` when it has
+/// none, its blob is gone, or its offsets fall outside the blob. For
+/// internal checks (D133) only: it ignores `sensitive`, which
+/// [`source_for`], the read path, honours.
+pub(crate) fn span_bytes(
+    store: &Store<'_>,
+    memory_id: &str,
+) -> Result<Option<Vec<u8>>, ArchiveError> {
+    let Some(span) = Archives::new(store).span_source(memory_id)? else {
+        return Ok(None);
+    };
+    let bytes = match std::fs::read(&span.archive_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let (Ok(start), Ok(end)) = (
+        usize::try_from(span.byte_start),
+        usize::try_from(span.byte_end),
+    ) else {
+        return Ok(None);
+    };
+    Ok(bytes.get(start..end).map(<[u8]>::to_vec))
+}
+
 /// Drop an import's archive: its spans, its row, and its blob.
 ///
 /// Called from [`crate::undo_import`]. Undoing an import deletes the

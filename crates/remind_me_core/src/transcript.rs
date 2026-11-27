@@ -444,6 +444,25 @@ fn render_dialog(messages: &[ChatMessage], message_tools: &MessageTools) -> Stri
     format!("{TRUNCATION_MARKER}{tail}")
 }
 
+/// The text a dialog row stores, rebuilt from its archived source span
+/// (#528, D133): a first row as a first capture renders it (cut to
+/// [`MAX_DIALOG_CHARS`]), a continuation as a recapture does (uncut), both
+/// scrubbed as they were when written.
+pub(crate) fn replay_row(span: &str, continuation: bool, tools: &MessageTools) -> String {
+    let messages = messages_of(span);
+    let text = if continuation {
+        messages
+            .iter()
+            .map(|m| render_message(m, tools))
+            .collect::<Vec<_>>()
+            .join(MESSAGE_SEPARATOR)
+    } else {
+        render_dialog(&messages, tools)
+    };
+    let (mut tags, mut metadata) = (Vec::new(), serde_json::json!({}));
+    crate::boundary::scrub(&text, &mut tags, &mut metadata)
+}
+
 impl TranscriptSummary {
     /// The summary half's title: the first user message, redacted, one
     /// line, cut. Redacted first: the title is stored as metadata, which the

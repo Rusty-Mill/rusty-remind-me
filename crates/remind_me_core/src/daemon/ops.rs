@@ -123,6 +123,13 @@ pub enum Op {
     DialogsCheck {
         full: bool,
     },
+    /// Rebuild every dialog into a scratch store and compare; see
+    /// [`crate::dialog_rebuild`]. `scratch` absolute, or `None` for the
+    /// default beside the database.
+    DialogsRebuildCheck {
+        scratch: Option<PathBuf>,
+        keep: bool,
+    },
     /// The session subcommands (`crate::session_ops`). Paths are absolute.
     SessionStart {
         session_id: String,
@@ -379,6 +386,11 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
             };
             to_value(crate::dialog_reconcile::check(store, depth))
         }
+        Op::DialogsRebuildCheck { scratch, keep } => to_value(crate::dialog_rebuild::check(
+            store,
+            scratch.as_deref(),
+            *keep,
+        )),
         Op::SessionStart {
             session_id,
             cwd,

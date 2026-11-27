@@ -117,6 +117,41 @@ fn dialog_lines(content: &str) -> Vec<&str> {
     content.lines().collect()
 }
 
+/// Refuse the first node whose range is not inside a dialog of
+/// `line_count` lines.
+fn check_ranges(
+    nodes: &BTreeMap<String, (usize, usize)>,
+    line_count: usize,
+) -> Result<(), SkeletonError> {
+    for (node, &(start, end)) in nodes {
+        // `start == 0` is caught by the same check: ranges are 1-based, so a
+        // model that emitted 0-based offsets fails loudly on its first node
+        // rather than silently returning one line too many forever.
+        if start == 0 || start > end || end > line_count {
+            return Err(SkeletonError::BadRange {
+                node: node.clone(),
+                start,
+                end,
+                lines: line_count,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether every node of `capture_id`'s skeleton still addresses lines of
+/// its whole dialog, by the check [`write_skeleton`] makes (D133). True
+/// when the capture has no skeleton.
+pub(crate) fn ranges_hold(store: &Store<'_>, capture_id: &str) -> Result<bool, SkeletonError> {
+    let Some(skeleton) = read_skeleton(store, capture_id)? else {
+        return Ok(true);
+    };
+    let full = get_capture(store, capture_id)?
+        .and_then(|c| c.full_dialog())
+        .unwrap_or_default();
+    Ok(check_ranges(&skeleton.nodes, dialog_lines(&full).len()).is_ok())
+}
+
 /// Store (or replace) a capture's skeleton.
 ///
 /// Replacing rather than appending: a capture has one shape, and a second
@@ -139,20 +174,7 @@ pub fn write_skeleton(
     // grown session appended after the first row.
     let full = capture.full_dialog().unwrap_or_default();
 
-    let line_count = dialog_lines(&full).len();
-    for (node, (start, end)) in &input.nodes {
-        // `start == 0` is caught by the same check: ranges are 1-based, so a
-        // model that emitted 0-based offsets fails loudly on its first node
-        // rather than silently returning one line too many forever.
-        if *start == 0 || start > end || *end > line_count {
-            return Err(SkeletonError::BadRange {
-                node: node.clone(),
-                start: *start,
-                end: *end,
-                lines: line_count,
-            });
-        }
-    }
+    check_ranges(&input.nodes, dialog_lines(&full).len())?;
 
     // Any previous skeleton goes first, so a replace cannot briefly leave two.
     let memories = Memories::new(store);
