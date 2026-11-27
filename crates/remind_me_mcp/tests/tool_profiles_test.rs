@@ -387,6 +387,50 @@ fn a_registered_format_is_the_default_when_the_call_sends_none() {
 }
 
 #[test]
+fn a_registered_format_follows_the_routed_handler() {
+    let registry = r#"{ "json-bot": { "format": "json" } }"#;
+    let (reference, history) = as_registered(registry, "json-bot", "core", || {
+        let s = server();
+        let added = call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "see #4242 for the numbat fix" }),
+        );
+        let id = serde_json::from_str::<Value>(&text(&added)).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (
+            // A reference search takes no format: injecting one would refuse it.
+            call(&s, "remind_me_search", json!({ "reference": "#4242" })),
+            // get's history handler takes one, so it gets the client's default.
+            call(
+                &s,
+                "remind_me_get",
+                json!({ "memory_id": id, "history": true }),
+            ),
+        )
+    });
+    assert_ne!(
+        reference["isError"],
+        json!(true),
+        "{}",
+        text(&reference)
+    );
+    assert_ne!(
+        history["isError"],
+        json!(true),
+        "{}",
+        text(&history)
+    );
+    assert!(
+        serde_json::from_str::<Value>(&text(&history)).is_ok(),
+        "{}",
+        text(&history)
+    );
+}
+
+#[test]
 fn a_registered_brief_budget_is_the_default_token_budget() {
     let registry = r#"{ "brief-bot": { "brief_budget": 600 } }"#;
     let (implicit, explicit) = as_registered(registry, "brief-bot", "core", || {
