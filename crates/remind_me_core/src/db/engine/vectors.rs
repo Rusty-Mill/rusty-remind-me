@@ -266,6 +266,8 @@ impl VectorStore for EngineTables {
                     .as_deref()
                     .is_some_and(crate::project::is_reserved_predicate)
             })
+            // A pinned persona line is a person's (pack D102): never merged.
+            .filter(|r| !crate::kinds::is_pinned_persona(&r.category, r.metadata_value().as_ref()))
             .collect();
         rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
         let mut candidates = Vec::new();

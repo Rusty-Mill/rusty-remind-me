@@ -40,6 +40,9 @@ pub struct StatementRow {
     pub content: String,
     pub vitality: f64,
     pub created_at: String,
+    /// Read for `pinned` and `kind` (#1555).
+    pub metadata: serde_json::Value,
+    pub written_by: String,
 }
 
 /// The port for the `promotions` table and the promotion reads over the

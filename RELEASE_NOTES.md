@@ -8,7 +8,7 @@ Dated entries, newest first. One entry per merged pull request.
 - `remind_me_entity_upsert` gains `merge_into`, `confirm` and `revert_merge` (D114, the D3 approval). `name` + `merge_into` previews: counts for both sides, links moved and shared, relations moved and dropped, aliases and kind A would gain; nothing is written. Adding `confirm: true` merges in one store transaction: B's links and relations move to A, B's name and aliases join A's aliases, A's kind is kept (B's fills a hole), the earlier `created_at` wins, a merge record is written and B is deleted. A repeat is a no-op naming the earlier merge.
 - The merge record is a fact memory (`B entity.merged_into A`, tag `entity-merge`, undo data in `metadata.entity_merge`). `revert_merge: <record id>` with `name` = B restores B exactly (row, links, relations, A's aliases, kind and `created_at`), keeps what A gained since, skips memories deleted since, and writes an `entity.merge_reverted` fact that supersedes the record (the #702 pattern, D113).
 - Refused: merging an entity into itself, a topic on either side, and absorbing a project (kind `project` or the subject of project claims; a project may absorb). A repeat by B's name or id is a no-op; asking to merge an absorbed B into a different entity is refused.
-- A revert is refused while a later live merge into the same entity, or one that absorbed the other end of a restored relation, still stands (revert those first), and when a relation end no longer exists, so a revert never deletes rows a later merge relied on or writes a dangling relation.
+- A revert is refused while a later live merge into or out of the survivor, or into or out of either end of a restored relation, still stands (revert those first), and when a relation end no longer exists, so a revert never deletes rows a later merge relied on or writes a dangling relation.
 - `EntityStore::delete_relation`, on both backends, conformance-tested.
 
 ### Changed
@@ -16,7 +16,22 @@ Dated entries, newest first. One entry per merged pull request.
 - Relations a merge moves are re-keyed under A's derived id. A B relation that would point A at itself, or whose triple A already has (under any id, since older stores keep pre-derivation ids), is dropped and A's row is left as it was.
 
 ### Tests
-- Core (`tests/entity_merge_test.rs`, 17): preview writes nothing; merge moves links, names and kind; an existing kind is kept; relations both ways with self-loop and duplicate dropped; idempotent repeat; revert restores exactly and refuses a second time; revert keeps later links and skips deleted memories; revert checks the name; self, topic and project refusals; project claims refuse; a later mention lands on the survivor; alias ties and the exact upsert; out-of-order reverts refused; a legacy-id triple blocks a duplicate; repeat by id and a different target; no kind fill through an alias. MCP: preview, confirm, repeat, revert and refused argument mixes. Conformance: `delete_relation` on engine and SQLite.
+- Core (`tests/entity_merge_test.rs`, 18): preview writes nothing; merge moves links, names and kind; an existing kind is kept; relations both ways with self-loop and duplicate dropped; idempotent repeat; revert restores exactly and refuses a second time; revert keeps later links and skips deleted memories; revert checks the name; self, topic and project refusals; project claims refuse; a later mention lands on the survivor; alias ties and the exact upsert; out-of-order reverts refused; a legacy-id triple blocks a duplicate; repeat by id and a different target; no kind fill through an alias. MCP: preview, confirm, repeat, revert and refused argument mixes. Conformance: `delete_relation` on engine and SQLite.
+
+## 2026-11-27 — Pinnable persona card (Mill Board #1555, D101, D102)
+
+### Added
+- A person can write a persona line by hand: `remind_me_add` with category `persona` and `metadata.pinned: true`. Only a human writer (`written_by: human`) may, and only pinned; promoted lines still come from `remind_me_promote`. Moving one's own memory into `persona` with `remind_me_update` follows the same rule.
+- `metadata.pinned` on any persona line, set or cleared with `remind_me_update`. A pinned line stands even when every source it was promoted from is superseded or deleted, is never offered for a refresh, and a `refreshes` naming it is refused (`PinnedRefresh`). It is still flagged `stale` when newer evidence arrives.
+- `metadata.kind` on a persona line: `instruction`, `preference` or `trait`. The session brief prefixes the line with `INSTRUCTION:`, `PREFERENCE:` or `TRAIT:`.
+- `remind_me_persona` statements carry `pinned` and `kind` when set, and the reply adds `total`.
+
+### Changed
+- Persona lists pinned lines first, then by vitality as before. The session brief keeps 10 persona lines; `remind_me_persona` lists at most 40 (`total` counts all). Before, it listed every line.
+- Add and update refuse a non-boolean `pinned` or an unknown `kind` on a persona memory, naming the key. A sourceless persona line written by a model before this change is withheld (listed under `include_demoted`).
+
+### Tests
+- A pin survives supersession of all its sources; unpinning restores demotion; pinned first; the card caps at 40 with the true total; sourceless pins stand only when human-written; add refused for a model, unpinned or unknown kind; update refuses bad kind or pin and a model moving its memory into `persona`; a refresh never replaces a pin; brief line prefix.
 
 ## 2026-11-26 — Entity overlap ranking signal measured and dropped (Mill Board #64, D92)
 

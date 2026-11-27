@@ -1391,6 +1391,12 @@ pub struct PersonaStatement {
     /// The newer related memories, newest first, when stale.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub new_evidence: Vec<String>,
+    /// Pinned by a person: listed first, never withdrawn (#1555).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+    /// `instruction`, `preference` or `trait`, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::kinds::PersonaKind>,
 }
 /// `source` every decomposed fact is stored under.
 pub const DECOMPOSITION_SOURCE: &str = "decomposition";
