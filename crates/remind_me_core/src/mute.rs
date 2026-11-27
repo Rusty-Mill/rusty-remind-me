@@ -351,6 +351,7 @@ fn set_on(store: &Store<'_>, existing: &Mute, on: bool) -> Result<Mute> {
         sensitive: None,
         clear_superseded: false,
         project: None,
+        if_version: None,
     };
     match crate::db::queries::update_memory(store, &input)? {
         UpdateOutcome::Updated(memory) => Ok(Mute {

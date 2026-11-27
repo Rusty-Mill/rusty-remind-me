@@ -169,6 +169,7 @@ fn a_project_mute_applies_only_in_that_project() {
             sensitive: None,
             clear_superseded: false,
             project: Some("alpha".into()),
+            if_version: None,
         },
     )
     .unwrap();
