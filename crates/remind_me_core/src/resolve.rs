@@ -30,6 +30,20 @@ pub fn demotes(outcome: &str) -> bool {
     matches!(outcome, "reverted" | "abandoned")
 }
 
+/// What resolve's reply suggests after an outcome that may mean an approach
+/// failed (card #1484, D109): record a dead end that links back here. Never
+/// created automatically, since "abandoned" often means deprioritised.
+/// `None` for the other outcomes.
+pub fn dead_end_hint(outcome: &str, memory_id: &str) -> Option<String> {
+    demotes(outcome).then(|| {
+        format!(
+            "If this failed rather than being dropped, record why so it is not tried again: \
+             remind_me_add with memory_type dead_end, metadata {{tried, why_failed, cost?, \
+             from: \"{memory_id}\"}}."
+        )
+    })
+}
+
 /// Resolve memory `memory_id` to `outcome`, with an optional `note`
 /// (stored as `metadata.outcome_note`). `None` when no live memory has the id.
 ///
@@ -194,6 +208,23 @@ pub fn validate_facts(facts: &[crate::models::AtomicFact]) -> Result<()> {
         checked.map_err(|e| StoreError::Invalid(format!("facts[{i}]: {e}")))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod hint_tests {
+    #[test]
+    fn abandoned_and_reverted_suggest_a_dead_end_and_the_rest_do_not() {
+        for outcome in ["abandoned", "reverted"] {
+            let hint = super::dead_end_hint(outcome, "mem_a").unwrap();
+            assert!(
+                hint.contains("dead_end") && hint.contains("mem_a"),
+                "{hint}"
+            );
+        }
+        for outcome in ["done", "superseded", "carded"] {
+            assert!(super::dead_end_hint(outcome, "mem_a").is_none());
+        }
+    }
 }
 
 #[cfg(test)]

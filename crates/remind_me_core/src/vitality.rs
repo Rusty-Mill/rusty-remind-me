@@ -25,6 +25,8 @@ pub fn get_decay_rate(category_or_type: &str) -> f64 {
     match category_or_type.to_lowercase().as_str() {
         "decision" => 0.02,
         "preference" => 0.03,
+        // A dead end stays dead (card #1484, D101): slow, like a preference.
+        "dead_end" => 0.03,
         "fact" => 0.05,
         "insight" => 0.07,
         "learning" => 0.08,
@@ -44,7 +46,7 @@ pub fn get_type_prior(category_or_type: &str) -> f64 {
         "decision" => 1.3,
         "blocker" => 1.2,
         "fact" | "insight" => 1.15,
-        "preference" => 1.1,
+        "preference" | "dead_end" => 1.1,
         "learning" => 1.05,
         "action_item" | "unclassified" => 1.0,
         // Slightly below neutral: reference material arrives in bulk (the

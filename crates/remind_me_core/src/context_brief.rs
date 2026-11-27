@@ -253,7 +253,10 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     let prompt = request.prompt.map(str::trim).filter(|p| !p.is_empty());
     if request.mode == Mode::Prompt {
         let drafts = match prompt {
-            Some(prompt) => vec![hits_draft(store, prompt, &[], now)?],
+            Some(prompt) => vec![
+                prompt_warnings_draft(store, prompt, request.project, now)?,
+                hits_draft(store, prompt, &[], now)?,
+            ],
             None => Vec::new(),
         };
         fit(&mut brief, drafts)?;
@@ -292,8 +295,14 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     let in_scope = without_overruled(&in_scope);
     brief.project = scope.project_match(&in_scope);
 
-    let mut drafts = Vec::new();
-    let mut rest = in_scope.clone();
+    // Dead ends go first and only there (card #1484, D103): never again in
+    // activity.
+    let mut drafts = vec![scope_warnings_draft(&memories, &scope)];
+    let mut rest: Vec<&Memory> = in_scope
+        .iter()
+        .copied()
+        .filter(|m| !is_dead_end(m))
+        .collect();
     if request.mode == Mode::Session {
         drafts.push(persona_draft(store)?);
         drafts.push(reminders_draft(store, now)?);
@@ -472,6 +481,8 @@ struct Draft {
     name: &'static str,
     weight: usize,
     items: Vec<Item>,
+    /// Items left out before the budget, by a section's own cap.
+    capped: usize,
 }
 
 fn first_line(content: &str) -> String {
@@ -582,11 +593,13 @@ fn project_drafts(memories: &[&Memory], since: DateTime<Utc>, branch: Option<&st
         Draft {
             name: "state",
             weight: 20,
+            capped: 0,
             items: state.into_iter().map(item).collect(),
         },
         Draft {
             name: "open",
             weight: 40,
+            capped: 0,
             items: open
                 .into_iter()
                 .take(OPEN_LIMIT)
@@ -596,6 +609,7 @@ fn project_drafts(memories: &[&Memory], since: DateTime<Utc>, branch: Option<&st
         Draft {
             name: "activity",
             weight: 40,
+            capped: 0,
             items: activity
                 .into_iter()
                 .take(ACTIVITY_LIMIT)
@@ -619,6 +633,7 @@ fn persona_draft(store: &Store<'_>) -> Result<Draft> {
     Ok(Draft {
         name: "persona",
         weight: 15,
+        capped: 0,
         items,
     })
 }
@@ -639,6 +654,7 @@ fn reminders_draft(store: &Store<'_>, now: DateTime<Utc>) -> Result<Draft> {
     Ok(Draft {
         name: "reminders",
         weight: 10,
+        capped: 0,
         items,
     })
 }
@@ -698,6 +714,7 @@ fn pinned_draft(store: &Store<'_>, now: DateTime<Utc>) -> Draft {
     Draft {
         name: "pinned",
         weight: 10,
+        capped: 0,
         items,
     }
 }
@@ -719,6 +736,7 @@ fn reviews_draft(memories: &[Memory], shown: &HashSet<&str>, now: DateTime<Utc>)
     Draft {
         name: "reviews",
         weight: 15,
+        capped: 0,
         items,
     }
 }
@@ -749,6 +767,69 @@ fn without_overruled<'a>(memories: &[&'a Memory]) -> Vec<&'a Memory> {
     memories.iter().copied().filter(|m| !overruled(m)).collect()
 }
 
+fn is_dead_end(memory: &Memory) -> bool {
+    memory.memory_type.as_deref() == Some(crate::kinds::MemoryKind::DeadEnd.as_str())
+}
+
+/// A dead end as one brief item: what was tried and why it failed.
+fn warning_item(warning: &crate::dead_ends::Warning) -> Item {
+    let text = format!("tried: {} — failed: {}", warning.tried, warning.why_failed);
+    Item {
+        id: warning.id.clone(),
+        kind: crate::kinds::MemoryKind::DeadEnd.as_str().to_string(),
+        text: first_line(&text),
+        at: warning.created_at.clone(),
+    }
+}
+
+fn warnings_draft(found: crate::dead_ends::Found) -> Draft {
+    Draft {
+        name: "warnings",
+        // First in priority: a warning is worth more than recent activity.
+        weight: 20,
+        items: found.warnings.iter().map(warning_item).collect(),
+        capped: found.omitted,
+    }
+}
+
+/// The scope's dead ends, newest first, not windowed (D103). `memories` are
+/// already fit to show unasked; a dead end with no project holds everywhere,
+/// so it joins every scope (D102).
+fn scope_warnings_draft(memories: &[Memory], scope: &Scope) -> Draft {
+    let candidates: Vec<Memory> = memories
+        .iter()
+        .filter(|m| is_dead_end(m) && (m.project.is_none() || scope.admits(m)))
+        .cloned()
+        .collect();
+    let found = crate::dead_ends::rank(
+        &candidates,
+        &crate::dead_ends::Request::default(),
+        crate::dead_ends::BRIEF_LIMIT,
+        Utc::now(),
+        &|_| true,
+    );
+    warnings_draft(found)
+}
+
+/// The dead ends the prompt repeats, in the hook's project (D103).
+fn prompt_warnings_draft(
+    store: &Store<'_>,
+    prompt: &str,
+    project: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Draft> {
+    let request = crate::dead_ends::Request {
+        query: Some(prompt),
+        project,
+        include_sensitive: false,
+    };
+    let found =
+        crate::dead_ends::find(store, &request, crate::dead_ends::PROMPT_LIMIT, now, &|m| {
+            injectable(m, now)
+        })?;
+    Ok(warnings_draft(found))
+}
+
 /// The prompt's matches, less any that loses a conflict to another match or
 /// to one of `rivals` (the memories the brief's other sections draw on), so
 /// hits never show an inference a statement shown elsewhere beat.
@@ -767,7 +848,7 @@ fn hits_draft(
     let hits: Vec<&Memory> = results
         .iter()
         .map(|r| &r.memory)
-        .filter(|m| injectable(m, now))
+        .filter(|m| injectable(m, now) && !is_dead_end(m))
         .collect();
     let hit_ids: HashSet<&str> = hits.iter().map(|m| m.id.as_str()).collect();
     let mut contenders = hits.clone();
@@ -785,6 +866,7 @@ fn hits_draft(
     Ok(Draft {
         name: "hits",
         weight: 25,
+        capped: 0,
         items,
     })
 }
@@ -834,7 +916,7 @@ fn overhead(brief: &Brief, drafts: &[Draft]) -> usize {
     envelope_cost(brief)
         + drafts
             .iter()
-            .map(|d| section_cost(d.name, d.items.len()))
+            .map(|d| section_cost(d.name, d.items.len() + d.capped))
             .sum::<usize>()
 }
 
@@ -886,7 +968,7 @@ fn fit(brief: &mut Brief, drafts: Vec<Draft>) -> Result<()> {
         spent_total += spent;
         brief.sections.push(Section {
             name: draft.name,
-            omitted: total - items.len(),
+            omitted: draft.capped + total - items.len(),
             items,
         });
     }
@@ -905,6 +987,7 @@ fn heading(name: &str) -> &'static str {
         "state" => "Current state",
         "open" => "Open: blockers, decisions, action items",
         "activity" => "Recent activity",
+        "warnings" => "Dead ends: tried before, and failed",
         _ => "Related to this prompt",
     }
 }
@@ -912,6 +995,7 @@ fn heading(name: &str) -> &'static str {
 fn line(section: &str, item: &Item) -> String {
     match section {
         "persona" | "pinned" => format!("- {}", item.text),
+        "warnings" => format!("- ⚠ {} ({})", item.text, item.id),
         "reminders" | "reviews" => format!("- due {}: {} ({})", item.at, item.text, item.id),
         _ => format!("- [{}] {} ({})", item.kind, item.text, item.id),
     }

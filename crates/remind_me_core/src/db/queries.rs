@@ -57,6 +57,7 @@ pub(crate) fn add_memory_reviewing(
     review: Review,
 ) -> Result<Memory> {
     let supersedes = input.supersedes.clone();
+    check_dead_end_source(store, fields.memory_type.as_deref(), &input.metadata)?;
     let add = PreparedAdd::new(input, fields, review)?;
     // With `supersedes`, one transaction: the insert, its index and every
     // retirement land together or not at all, and each target is checked
@@ -68,6 +69,27 @@ pub(crate) fn add_memory_reviewing(
         store.transaction(|tx| add.write(tx, &supersedes))?;
     }
     add.finish(store)
+}
+
+/// A dead end's `metadata.from` names a live memory (card #1484, D109):
+/// the decision or action item it came from. Other kinds are not checked.
+fn check_dead_end_source(
+    store: &Store<'_>,
+    kind: Option<&str>,
+    metadata: &serde_json::Value,
+) -> Result<()> {
+    if kind != Some(crate::kinds::MemoryKind::DeadEnd.as_str()) {
+        return Ok(());
+    }
+    let Some(from) = metadata.get("from").and_then(serde_json::Value::as_str) else {
+        return Ok(());
+    };
+    if Memories::new(store).get_live(from.trim())?.is_some() {
+        return Ok(());
+    }
+    Err(StoreError::Invalid(format!(
+        "dead_end metadata.from {from:?} is not a live memory id"
+    )))
 }
 
 /// An add, validated and scrubbed, split into its write and what follows
@@ -315,6 +337,13 @@ pub fn update_memory_with(
         .map(|m| crate::consolidation::keep_evidence(m, Some(&stored.metadata)));
     let metadata = client_metadata.as_ref().unwrap_or(&stored.metadata);
     fields.validate(metadata, stored.memory_type.as_deref())?;
+    if client_metadata.is_some() || fields.memory_type.is_some() {
+        let kind = fields
+            .memory_type
+            .as_deref()
+            .or(stored.memory_type.as_deref());
+        check_dead_end_source(store, kind, metadata)?;
+    }
     // Only metadata this edit supplies: a stored value is never revalidated,
     // so an edit that leaves metadata alone cannot fail on it (pack D86).
     if let Some(supplied) = &client_metadata {
@@ -1340,7 +1369,10 @@ pub fn search_with_expansions(
     // the cap should degrade to "no budget left for hits" rather than wrap to
     // an enormous one. A budget of 0 (unlimited) stays 0 here, which is right
     // — an unlimited search does not become limited by having a bootstrap.
-    let spent = bootstrap.as_ref().map_or(0, |b| b.tokens_used);
+    // Dead-end warnings spend from the budget next, like the bootstrap, and
+    // reserve at most a quarter of it (card #1484, D103).
+    let found = search_warnings(store, input)?;
+    let spent = bootstrap.as_ref().map_or(0, |b| b.tokens_used) + found.tokens;
     let hit_input;
     let hit_input = if spent == 0 {
         input
@@ -1359,7 +1391,14 @@ pub fn search_with_expansions(
             .as_ref()
             .map(|e| &**e as &dyn crate::embedder::Embedder),
     )?;
-    let memories = outcome.results;
+    // A dead end shown as a warning is not shown again among the hits.
+    let warned: std::collections::HashSet<&str> =
+        found.warnings.iter().map(|w| w.id.as_str()).collect();
+    let memories: Vec<_> = outcome
+        .results
+        .into_iter()
+        .filter(|r| !warned.contains(r.memory.id.as_str()))
+        .collect();
     let ids: Vec<String> = memories.iter().map(|r| r.memory.id.clone()).collect();
 
     expansion::record_co_retrieval(store, &ids)?;
@@ -1392,6 +1431,8 @@ pub fn search_with_expansions(
         dormant_excluded: outcome.dormant_excluded,
         bootstrap,
         inferred_window,
+        warnings: found.warnings,
+        warnings_omitted: found.omitted,
         memories,
         total_candidates: outcome.total_candidates,
         returned: outcome.returned,
@@ -1409,6 +1450,59 @@ pub fn search_with_expansions(
     crate::vitality::record_accesses(store, &ids)?;
 
     Ok(response)
+}
+
+/// A search's dead-end warnings and the tokens they spend.
+struct SearchWarnings {
+    warnings: Vec<crate::dead_ends::Warning>,
+    omitted: usize,
+    tokens: usize,
+}
+
+/// The dead ends a search's query repeats (card #1484, D102-D103): at most
+/// [`crate::dead_ends::SEARCH_LIMIT`], within a quarter of the token budget
+/// (none dropped when it is unlimited). A listing (empty query) has none.
+fn search_warnings(store: &Store<'_>, input: &MemorySearchInput) -> Result<SearchWarnings> {
+    let query = input.query.trim();
+    if query.is_empty() {
+        return Ok(SearchWarnings {
+            warnings: Vec::new(),
+            omitted: 0,
+            tokens: 0,
+        });
+    }
+    let request = crate::dead_ends::Request {
+        query: Some(query),
+        project: input.scope.project.as_deref(),
+        include_sensitive: input.include_sensitive,
+    };
+    let found = crate::dead_ends::find(
+        store,
+        &request,
+        crate::dead_ends::SEARCH_LIMIT,
+        Utc::now(),
+        &|_| true,
+    )?;
+    let reserve = input.token_budget / 4;
+    let mut kept = Vec::new();
+    let mut tokens = 0;
+    let mut omitted = found.omitted;
+    for warning in found.warnings {
+        let cost = crate::retrieval::estimated_content_tokens(
+            &serde_json::to_string(&warning).unwrap_or_default(),
+        );
+        if input.token_budget > 0 && tokens + cost > reserve {
+            omitted += 1;
+            continue;
+        }
+        tokens += cost;
+        kept.push(warning);
+    }
+    Ok(SearchWarnings {
+        warnings: kept,
+        omitted,
+        tokens,
+    })
 }
 
 /// A page of memories awaiting extraction, newest first.

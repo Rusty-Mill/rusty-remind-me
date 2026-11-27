@@ -27,11 +27,14 @@ pub enum MemoryKind {
     Learning,
     Blocker,
     WorkLog,
+    /// An approach that was tried and failed (`metadata.tried`,
+    /// `metadata.why_failed`, card #1484). Warned about before a repeat.
+    DeadEnd,
     Unclassified,
 }
 
 impl MemoryKind {
-    pub const ALL: [MemoryKind; 10] = [
+    pub const ALL: [MemoryKind; 11] = [
         Self::Decision,
         Self::ActionItem,
         Self::Preference,
@@ -41,6 +44,7 @@ impl MemoryKind {
         Self::Learning,
         Self::Blocker,
         Self::WorkLog,
+        Self::DeadEnd,
         Self::Unclassified,
     ];
 
@@ -55,6 +59,7 @@ impl MemoryKind {
             Self::Learning => "learning",
             Self::Blocker => "blocker",
             Self::WorkLog => "work_log",
+            Self::DeadEnd => "dead_end",
             Self::Unclassified => "unclassified",
         }
     }
@@ -284,6 +289,51 @@ pub fn validate_metadata(kind: MemoryKind, metadata: &Value) -> Result<(), KindE
     match kind {
         MemoryKind::Decision => validate_decision(metadata),
         MemoryKind::ActionItem => validate_action_item(metadata),
+        MemoryKind::DeadEnd => validate_dead_end(metadata),
+        _ => Ok(()),
+    }
+}
+
+/// Longest `tried` or `why_failed` a dead end may hold, in characters.
+pub const DEAD_END_TEXT_MAX: usize = 1000;
+/// The effort words a dead end's `cost` may hold instead of minutes.
+pub const DEAD_END_COSTS: [&str; 3] = ["low", "medium", "high"];
+
+/// A dead end (pack D101): `tried` and `why_failed` required, non-empty, at
+/// most [`DEAD_END_TEXT_MAX`] characters; `cost` optional, a positive whole
+/// number of minutes or one of [`DEAD_END_COSTS`]; `from` optional, the id
+/// of the memory it came from (checked as a live memory where it is
+/// written, since this check has no store).
+fn validate_dead_end(meta: &Value) -> Result<(), KindError> {
+    const K: &str = "dead_end";
+    for key in ["tried", "why_failed"] {
+        match str_field(meta, K, key)? {
+            Some(text) if !text.trim().is_empty() => {
+                if text.chars().count() > DEAD_END_TEXT_MAX {
+                    return Err(bad(
+                        K,
+                        key,
+                        format!("must be at most {DEAD_END_TEXT_MAX} characters"),
+                    ));
+                }
+            }
+            _ => return Err(bad(K, key, "is required: a non-empty string")),
+        }
+    }
+    match meta.get("cost") {
+        None | Some(Value::Null) => {}
+        Some(Value::Number(n)) if n.as_u64().is_some_and(|m| m > 0) => {}
+        Some(Value::String(s)) if DEAD_END_COSTS.contains(&s.as_str()) => {}
+        Some(_) => {
+            return Err(bad(
+                K,
+                "cost",
+                "must be a positive whole number of minutes or one of low, medium, high",
+            ))
+        }
+    }
+    match str_field(meta, K, "from")? {
+        Some(id) if id.trim().is_empty() => Err(bad(K, "from", "must be a memory id")),
         _ => Ok(()),
     }
 }
@@ -594,6 +644,19 @@ pub fn kind_lines(m: &crate::models::Memory) -> Vec<String> {
             }
             parts.push(format!("**Status:** {}", text("status").unwrap_or("open")));
             lines.push(parts.join("  |  "));
+        }
+        Some(MemoryKind::DeadEnd) => {
+            if let Some(tried) = text("tried") {
+                lines.push(format!("**Tried:** {tried}"));
+            }
+            if let Some(why) = text("why_failed") {
+                lines.push(format!("**Why it failed:** {why}"));
+            }
+            match m.metadata.get("cost") {
+                Some(Value::Number(n)) => lines.push(format!("**Cost:** {n} min")),
+                Some(Value::String(c)) => lines.push(format!("**Cost:** {c}")),
+                _ => {}
+            }
         }
         _ => {}
     }

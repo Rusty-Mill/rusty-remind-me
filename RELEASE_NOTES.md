@@ -2,6 +2,20 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-27 — Dead ends that warn before they're repeated (Mill Board #1484, D101-D103, D109)
+
+### Added
+- `memory_type: dead_end`: an approach that was tried and failed. `metadata.tried` and `metadata.why_failed` are required (non-empty, at most 1,000 characters); `cost` is optional (positive minutes, or `low`/`medium`/`high`); `from` is optional and must name a live memory. Decay 0.03, type prior 1.1. Nothing existing is reclassified.
+- `warnings` and `warnings_omitted` on `remind_me_search` (and `GET /api/memories/search`): up to 3 dead ends the query repeats, outside the ranking and `limit`, within a quarter of the token budget. Matching is lexical (at least half of the dead end's words, and at least 2, appear in the query; stopwords and words under 3 characters ignored), in the request's project or with none, never sensitive unless asked. A warned dead end is left out of that response's hits. Markdown shows a "Dead ends" block above the hits; compact JSON cuts `tried`/`why_failed` to 200 characters.
+- A `warnings` section first in the project and session briefs (the scope's dead ends plus projectless ones, newest first, up to 3; no longer repeated in activity) and in the prompt hook's brief (dead ends the prompt repeats, up to 2, inside the same 750-token budget; the hook script is unchanged).
+- `remind_me_resolve` with `abandoned` or `reverted` adds `dead_end_hint` (JSON) or a closing line (Markdown) suggesting a dead end with `from` set. Nothing is created automatically.
+
+### Not done
+- No PreToolUse blocking hook (D103: worth adding if repeats persist despite warnings, or once dead ends record an exact command or path). Semantic matching is Q28.
+
+### Tests
+- Field validation and `from`; match, no match, other project, sensitive, cap and `limit` on search; the project brief's section and its absence from activity; the prompt hook's match, miss and cap; resolve's hint; MCP Markdown and compact JSON.
+
 ## 2026-11-26 — Entity overlap ranking signal measured and dropped (Mill Board #64, D92)
 
 ### Added
