@@ -304,3 +304,39 @@ fn a_mute_cannot_be_reclassified_out_of_preference() {
     assert_eq!(result.refused, [record.id]);
     assert_eq!(mute::list(&store).unwrap().len(), 1);
 }
+
+#[test]
+fn muted_matches_do_not_crowd_an_eligible_hit_out_of_the_prompt_hook() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    for i in 0..30 {
+        add(
+            &store,
+            &format!("rebuild the musl target with jemalloc, take {i}"),
+            None,
+            &["noise"],
+        );
+    }
+    let eligible = add(
+        &store,
+        "weekly notes: the office moved, lunch is at noon, and musl came up once",
+        None,
+        &[],
+    );
+    mute::mute(&store, Target::Tag, "noise", None).unwrap();
+    let request = ContextRequest {
+        mode: Mode::Prompt,
+        prompt: Some("rebuild the musl target with jemalloc"),
+        budget: 0,
+        ..ContextRequest::default()
+    };
+    let Outcome::Brief(brief) = context_brief::build(&store, &request).unwrap() else {
+        panic!("not a brief");
+    };
+    let hits: Vec<&str> = brief
+        .sections
+        .iter()
+        .flat_map(|s| s.items.iter().map(|i| i.id.as_str()))
+        .collect();
+    assert_eq!(hits, [eligible.as_str()]);
+}

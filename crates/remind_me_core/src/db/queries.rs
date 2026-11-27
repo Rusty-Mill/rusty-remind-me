@@ -879,33 +879,35 @@ pub fn search_memories_deadlined(
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
 ) -> Result<crate::retrieval::TrimOutcome> {
-    search_ranked(store, input, embedder, deadline, false)
+    search_ranked(store, input, embedder, deadline, &|_| false)
 }
 
-/// [`search_memories`] with dead ends left out of both ranking lanes, before
-/// their limits, so they never take a hit's place and the candidate pool
-/// stays the size `input` asks for. For a caller that shows dead ends apart,
-/// as warnings (card #1484).
-pub fn search_memories_without_dead_ends(
+/// [`search_memories`] with the memories `skip` matches left out of both
+/// ranking lanes, before their limits, so they never take a hit's place and
+/// the candidate pool stays the size `input` asks for. For a caller that
+/// shows some memories apart or not at all, as the prompt hook does dead ends
+/// (card #1484) and muted memories (card #1485).
+pub fn search_memories_skipping(
     store: &Store<'_>,
     input: &MemorySearchInput,
+    skip: &dyn Fn(&Memory) -> bool,
 ) -> Result<Vec<MemorySearchResult>> {
     let configured = crate::embedder::available_embedder();
     let embedder = configured
         .as_ref()
         .map(|e| &**e as &dyn crate::embedder::Embedder);
     let deadline = crate::retrieval::Deadline::from_env();
-    Ok(search_ranked(store, input, embedder, deadline, true)?.results)
+    Ok(search_ranked(store, input, embedder, deadline, skip)?.results)
 }
 
-/// The search behind [`search_memories_deadlined`]. `exclude_dead_ends`
-/// leaves dead ends out of both lanes, inside each before its limit.
+/// The search behind [`search_memories_deadlined`]. `skip` leaves memories
+/// out of both lanes, inside each before its limit.
 fn search_ranked(
     store: &Store<'_>,
     input: &MemorySearchInput,
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
-    exclude_dead_ends: bool,
+    skip: &dyn Fn(&Memory) -> bool,
 ) -> Result<crate::retrieval::TrimOutcome> {
     let memories_repo = Memories::new(store);
     let mut timing = crate::retrieval::SearchTiming {
@@ -980,7 +982,7 @@ fn search_ranked(
             listed
         };
         if listed.is_empty() && filter.exclude_raw && !input.window.is_unbounded() {
-            return raw_fallback(store, input, embedder, deadline, timing, exclude_dead_ends);
+            return raw_fallback(store, input, embedder, deadline, timing, skip);
         }
         let mut outcome = trim_by_token_budget(listed, input.token_budget, input.detail);
         timing.elapsed_ms = deadline.elapsed_ms();
@@ -992,7 +994,6 @@ fn search_ranked(
     // `RrfFusion::Score` mode needs the raw BM25 magnitude alongside each hit.
     let mut keyword_memories = Vec::new();
     let mut keyword_bm25 = std::collections::HashMap::new();
-    let skip = |m: &Memory| exclude_dead_ends && crate::dead_ends::is_dead_end(m);
     for (memory, bm25_score) in
         memories_repo.keyword_hits_skipping(&phrases, &filter, input.limit * 2, &skip)?
     {
@@ -1159,7 +1160,7 @@ fn search_ranked(
     ranked.truncate(input.limit);
 
     if ranked.is_empty() && filter.exclude_raw {
-        return raw_fallback(store, input, embedder, deadline, timing, exclude_dead_ends);
+        return raw_fallback(store, input, embedder, deadline, timing, skip);
     }
 
     let mut outcome = trim_by_token_budget(ranked, input.token_budget, input.detail);
@@ -1233,13 +1234,13 @@ fn raw_fallback(
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
     first: crate::retrieval::SearchTiming,
-    exclude_dead_ends: bool,
+    skip: &dyn Fn(&Memory) -> bool,
 ) -> Result<crate::retrieval::TrimOutcome> {
     let raw = MemorySearchInput {
         include_raw: true,
         ..input.clone()
     };
-    let mut outcome = search_ranked(store, &raw, embedder, deadline, exclude_dead_ends)?;
+    let mut outcome = search_ranked(store, &raw, embedder, deadline, skip)?;
     outcome.raw_fallback = !outcome.results.is_empty();
     for stage in first.skipped {
         if !outcome.timing.skipped.contains(&stage) {

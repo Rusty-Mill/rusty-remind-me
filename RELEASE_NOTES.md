@@ -7,11 +7,11 @@ Dated entries, newest first. One entry per merged pull request.
 ### Added
 - Mutes on an entity, a topic (and its subtree) or a tag, global or per project. A mute is a `preference` memory in category `mute` with `metadata.mute = {target: entity|topic|tag, value, on, project?}`; writes in that category are checked (preference kind, valid spec, entity or topic exists, a `topic:` name refused as an entity). No schema change, no new tool.
 - CLI: `rusty-remind-me mute|unmute <entity|topic|tag> <VALUE> [--project NAME]` and `rusty-remind-me mutes`. Muting again re-enables the existing record; unmuting turns it off and keeps it.
-- Muted memories leave the session and project briefs, the prompt hook (hits and dead-end warnings), reminders in the brief and the digest's recent memories (`muted_hidden` counts them; the Markdown says so). Mute records are never listed there and consolidation leaves them alone.
+- Muted memories leave the session and project briefs, the prompt hook (hits and dead-end warnings; muted memories and mute records are left out inside its search, before the hit limit, so they never take a real hit's place), reminders in the brief and the digest's recent memories (`muted_hidden` counts them; the Markdown says so). Mute records are never listed there and consolidation leaves them alone.
 - An explicit `remind_me_search` still returns muted memories and marks each `"muted": true` (full and compact JSON) with a Markdown note. A project brief never mutes its own project entity.
 
 ### Tests
-- Muted entity, tag and topic leave the brief; search still finds and marks; unmute restores and re-muting reuses the record; project scoping; digest count; validation; CLI parsing.
+- Muted entity, tag and topic leave the brief; search still finds and marks; unmute restores and re-muting reuses the record; project scoping; digest count; validation; CLI parsing; muted matches not crowding an eligible prompt hit out.
 
 ## 2026-11-27 — Dead ends that warn before they're repeated (Mill Board #1484, D115-D117, D123)
 

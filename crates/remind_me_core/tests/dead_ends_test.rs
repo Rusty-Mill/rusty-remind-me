@@ -552,7 +552,9 @@ fn a_search_leaving_out_dead_ends_fills_its_own_limit_without_them() {
         limit: 10,
         ..MemorySearchInput::default()
     };
-    let hits = queries::search_memories_without_dead_ends(&store, &input).unwrap();
+    let hits =
+        queries::search_memories_skipping(&store, &input, &remind_me_core::dead_ends::is_dead_end)
+            .unwrap();
     assert_eq!(hits.len(), 10);
     assert!(hits.iter().all(|h| h.memory.id.starts_with('f')));
 }
