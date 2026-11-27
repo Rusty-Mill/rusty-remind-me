@@ -60,6 +60,7 @@ fn update(memory_id: &str) -> MemoryUpdateInput {
     MemoryUpdateInput {
         project: None,
         memory_id: memory_id.to_string(),
+        if_version: None,
         content: None,
         category: None,
         tags: None,

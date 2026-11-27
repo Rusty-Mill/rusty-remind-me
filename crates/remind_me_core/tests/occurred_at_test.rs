@@ -39,6 +39,7 @@ fn update_metadata(store: &Store<'_>, id: &str, metadata: Option<Value>) -> Upda
         store,
         &MemoryUpdateInput {
             memory_id: id.to_string(),
+            if_version: None,
             content: None,
             category: None,
             tags: Some(vec!["edited".into()]),
@@ -144,6 +145,7 @@ fn update_can_set_and_clear_occurred_at() {
         &store,
         &MemoryUpdateInput {
             memory_id: id.clone(),
+            if_version: None,
             content: None,
             category: None,
             tags: None,

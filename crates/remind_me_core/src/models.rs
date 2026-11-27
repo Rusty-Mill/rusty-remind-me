@@ -611,6 +611,11 @@ pub struct MemoryUpdateInput {
     /// or blank leaves it alone; there is no way to clear it to null here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Write only if the memory's version is still this one (#1487): the
+    /// `version` a read returned. On a mismatch nothing is written and the
+    /// update fails with the current version. `None` is last-write-wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_version: Option<String>,
 }
 
 /// Outcome of an update attempt.
@@ -2289,6 +2294,9 @@ pub struct SavedMemory<'a> {
     pub check: SaveCheck,
     #[serde(flatten)]
     pub duplicates: DuplicateCheck,
+    /// The memory's version, to pass as `if_version` on its next update
+    /// (#1487).
+    pub version: String,
 }
 
 /// A page of candidate pairs.

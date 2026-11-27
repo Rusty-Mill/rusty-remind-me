@@ -166,7 +166,7 @@ impl PreparedAdd {
             category: input.category.clone(),
             tags: input.tags.clone(),
             source: input.source.clone(),
-            metadata: input.metadata.clone(),
+            metadata: provenance.metadata(input.metadata.clone()),
             subject: input.subject.clone(),
             predicate: input.predicate.clone(),
             object: input.object.clone(),
@@ -355,10 +355,60 @@ pub fn update_memory_with(
     input: &MemoryUpdateInput,
     fields: &StructuredFields,
 ) -> Result<UpdateOutcome> {
-    let Some(stored) = get_memory_by_id(store, &input.memory_id)? else {
-        return Ok(UpdateOutcome::NotFound);
-    };
-    crate::dialog::refuse_protected_edit(&stored)?;
+    update_memory_pausing(store, input, fields, &|| {})
+}
+
+/// [`update_memory_with`], calling `after_read` between reading the memory
+/// and writing it: where a concurrent writer would otherwise slip in. For
+/// tests that put one there.
+#[doc(hidden)]
+pub fn update_memory_pausing(
+    store: &Store<'_>,
+    input: &MemoryUpdateInput,
+    fields: &StructuredFields,
+    after_read: &dyn Fn(),
+) -> Result<UpdateOutcome> {
+    let expect = crate::version::Expect::parse(input.if_version.as_deref(), false)?;
+    // Read, check and write in one transaction (pack D122), so a writer
+    // holding the same version cannot land between the check and the edit.
+    let written = store.atomically(|store| -> Result<UpdateOutcome> {
+        let Some(stored) = get_memory_by_id(store, &input.memory_id)? else {
+            return Ok(UpdateOutcome::NotFound);
+        };
+        after_read();
+        crate::version::check(expect.as_ref(), Some(&crate::version::of_memory(&stored)))?;
+        write_update(store, input, fields, &stored)
+    })?;
+    if !matches!(written, UpdateOutcome::Updated(_)) {
+        return Ok(written);
+    }
+
+    // Only a content change invalidates the stored embeddings — category,
+    // tags and metadata don't change what the text means. Best-effort, same
+    // as `add_memory`: an embedding failure here does not undo the update
+    // that already committed.
+    if let Some(content) = &input.content {
+        if let Some(embedder) = crate::embedder::available_embedder() {
+            let _ = crate::vectors::embed_and_store(store, &*embedder, &input.memory_id, content);
+        }
+    }
+
+    let memory = get_memory_by_id(store, &input.memory_id)?.ok_or(StoreError::NotFound)?;
+    crate::events::emit(crate::events::Event::Updated, &memory.id, &memory.category);
+
+    Ok(UpdateOutcome::Updated(Box::new(memory)))
+}
+
+/// The checks and the edit of one update, against the row read under the
+/// same transaction. Returns `Updated` with the pre-edit row as a marker;
+/// the caller re-reads the written one.
+fn write_update(
+    store: &Store<'_>,
+    input: &MemoryUpdateInput,
+    fields: &StructuredFields,
+    stored: &crate::models::Memory,
+) -> Result<UpdateOutcome> {
+    crate::dialog::refuse_protected_edit(stored)?;
     let project = crate::context::explicit_project(input.project.as_deref())?;
     // Replacing metadata keeps the system-owned evidence count (#354), so an
     // edit can neither clobber it nor reset it under an already boosted
@@ -393,7 +443,7 @@ pub fn update_memory_with(
     if let Some(supplied) = &client_metadata {
         crate::kinds::validate_occurred_at(supplied)?;
     }
-    check_persona_edit(&stored, input.category.as_deref(), metadata)?;
+    check_persona_edit(stored, input.category.as_deref(), metadata)?;
     // Becoming a decision schedules its follow-up; staying one does not.
     let scheduled = if stored.memory_type.as_deref() == Some("decision") {
         None
@@ -454,25 +504,12 @@ pub fn update_memory_with(
     };
     // The revision and the edit land together or not at all (Q21): a
     // revision without its edit would hold the current value as history.
+    // Already inside the caller's transaction, so this joins it.
     store.atomically(|store| -> Result<()> {
         crate::history::capture_revision(store, &input.memory_id, &tracked, None)?;
         Memories::new(store).apply_edit(&input.memory_id, &edit)
     })?;
-
-    // Only a content change invalidates the stored embeddings — category,
-    // tags and metadata don't change what the text means. Best-effort, same
-    // as `add_memory`: an embedding failure here does not undo the update
-    // that already committed.
-    if let Some(content) = &input.content {
-        if let Some(embedder) = crate::embedder::available_embedder() {
-            let _ = crate::vectors::embed_and_store(store, &*embedder, &input.memory_id, content);
-        }
-    }
-
-    let memory = get_memory_by_id(store, &input.memory_id)?.ok_or(StoreError::NotFound)?;
-    crate::events::emit(crate::events::Event::Updated, &memory.id, &memory.category);
-
-    Ok(UpdateOutcome::Updated(Box::new(memory)))
+    Ok(UpdateOutcome::Updated(Box::new(stored.clone())))
 }
 
 /// Delete a memory. Returns `false` if no live memory had that id.

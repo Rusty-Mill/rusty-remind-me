@@ -13,6 +13,35 @@ Dated entries, newest first. One entry per merged pull request.
 ### Tests
 - Muted entity, tag and topic leave the brief; search still finds and marks; unmute restores and re-muting reuses the record; project scoping; digest count; validation; CLI parsing; muted matches not crowding an eligible prompt hit out.
 
+## 2026-11-27 — Version checks so clients can't overwrite each other (Mill Board #1487, D119-D122, D125)
+
+### Added
+- `version` on reads: `remind_me_get` (each memory, with `memory_id` or `memory_ids`), the `remind_me_add` and `remind_me_update` replies, `remind_me_wiki_read` and the wiki write reply, `remind_me_project` `get`/`set`/`revert`, and their REST routes (`GET`/`PATCH /api/memories/{id}`, `GET /api/wiki/{slug}`, `POST /api/wiki`, `/api/projects`). It is `v1:` plus 16 hex characters of SHA-256 over what a write can change, computed on read and never stored: no schema or record change.
+- Optional `if_version` on `remind_me_update`, `remind_me_wiki_write` (`"absent"` = create only) and `remind_me_project` `set`/`revert`, and on the same REST routes. On a mismatch nothing is written: MCP returns the ADR-0028 error `version_conflict` with `current_version` (and `updated_at` for a memory or page); REST answers 409 with the same body. A malformed value is refused as invalid input before any read. Without it, the last write wins as before.
+- `StoreError::Conflict { current_version }`, `remind_me_core::version`.
+
+### Changed
+- A memory update now reads, checks and writes in one transaction (it read outside it before). Project `set`/`revert` check inside their existing transaction. A wiki page is written to a temporary file and renamed into place; an edit made in an editor between the check and the rename is the one race a file leaves.
+
+### Tests
+- Match writes, mismatch writes nothing (row, revision count, page, claim chain), absent precondition, malformed value, two writers holding one version on the Engine and SQLite backends (exactly one wins), and the same code and body over MCP and REST.
+
+## 2026-11-27 — Per-client tool profile, format and brief budget; the `minimal` profile (Mill Board #1552 PR B, ADR-0028 step 3, D126-D131)
+
+### Added
+- `minimal` tool profile: search, get, add, auto_capture and brief only, for small local models. Before this, `minimal` was unrecognised and fell back to `full`. `minimal,<group>` adds a group; any part that turns on core (`core`, `standard`, `full`) wins. An alias works exactly when the tool it merged into is listed. A preset, not a group (ADR-0030 amended).
+- `clients.json` entries take `profile`, `format` (`markdown` or `json`) and `brief_budget` (200 to 8000), checked at load; a bad value makes the registry unusable with the reason.
+- For the resolved caller, the registry `profile` beats `REMIND_ME_TOOL_PROFILE`, `format` is the default `response_format` on every tool that takes one (an explicit value still wins), and `brief_budget` is `remind_me_brief`'s `token_budget` when the call sends none.
+- The remote connector lists tools per caller (`tools_for`), so the list matches what that caller may call.
+- A refused tool names the setting that turns it on: the client's `profile` in `clients.json` when the profile came from there, else `REMIND_ME_TOOL_PROFILE`. `remind_me_server_status`'s `tool_profile` gains `tools` (the count).
+
+### Unchanged
+- With no registry, or a client it does not list, profile and format resolve as before. No tool is renamed or removed; no schema change.
+- Not yet: the ADR-0028 §3 CI test over descriptions and schemas (with #52/#54, D130).
+
+### Tests
+- `minimal` lists exactly five tools and refuses core ones with the remedy; `minimal,wiki`, `minimal,core`, `minimal,standard`; a registered profile beats the env and its refusal names the registry; an unlisted client keeps the env profile; a registered format becomes search's default and an explicit one wins; a registered brief budget is the default and an explicit one wins; registry field validation.
+
 ## 2026-11-27 — Dead ends that warn before they're repeated (Mill Board #1484, D115-D117, D123)
 
 ### Added
@@ -26,6 +55,23 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Tests
 - Field validation and `from`; match, no match, other project, sensitive, cap and `limit` on search; the project brief's section and its absence from activity; the prompt hook's match, miss and cap; a long warning in a tight budget; another project's dead end or fact not silencing ours; many dead ends not crowding ordinary hits out of the prompt hook; resolve's hint; MCP Markdown and compact JSON.
+
+## 2026-11-27 — Client registry: who is calling, by a stable id (Mill Board #1552 PR A, ADR-0028 step 2, D106-D109)
+
+### Added
+- `clients.json` beside the store (`REMIND_ME_CLIENTS_FILE` overrides): registered client ids (`[a-z0-9-]{1,40}`, `unknown` reserved) with handshake `aliases`, `oauth_clients` and REST `api_keys` names. A bad id, unknown field, blank value or a value claimed by two clients makes the file unusable, with the reason.
+- With a valid registry, `client` resolves credential > `REMIND_ME_CLIENT` > registered handshake alias (the name before `/`, exactly) > `unknown`, so several bots on one MCP SDK are told apart. The raw handshake is kept in `metadata.client_app` on add, auto_capture and decompose; a value the caller set is never overwritten.
+- REST: the verified API key's name (`default` for the flat key) is the call's credential.
+- `remind_me_server_status` gains a `clients` block: `registry` (`off`, `unusable`, `ready`), `path`, `reason`, `registered`, `unknown_writes` (memory rows this process inserted as `unknown`) and `counting_since`.
+
+### Unchanged
+- With no `clients.json` (every install today) the old rule holds: handshake, then `REMIND_ME_CLIENT`, then `unknown`. Deploying changes no stamped value until the file is written.
+- The capture-only credential's pinned name still stamps `client` in every registry state (D67).
+- Not yet: the `client` filter on search (needs Nano's OK, D108) and OAuth client ids (D107). No schema change or migration.
+
+### Tests
+- Each resolution tier and registry state, the capture pin, invalid files; alias to id with `client_app` stored; env beats handshake; strangers counted as unknown; a registered API key name stamps its client over REST.
+
 ## 2026-11-27 — Pinnable persona card (Mill Board #1555, D101, D102)
 
 ### Added

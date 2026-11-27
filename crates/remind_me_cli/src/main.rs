@@ -1162,10 +1162,15 @@ fn run_admin(db_path: &std::path::Path, rest: &[String]) -> Result<(), Box<dyn s
     };
     // Before the daemon is reached: a daemon connection carries this process's
     // value of the variable, and the admin group is hidden by default.
+    // `admin` is the person, not a client: an inherited `REMIND_ME_CLIENT`
+    // would put a registered client's narrower profile ahead of `full`.
     // Safe here, unlike in a test: this is the only thread, before the store
     // is opened, so no C code (SQLite's init) can be reading the environment.
     #[allow(clippy::disallowed_methods)]
-    env::set_var(TOOL_PROFILE_ENV, "full");
+    {
+        env::set_var(TOOL_PROFILE_ENV, "full");
+        env::remove_var("REMIND_ME_CLIENT");
+    }
     let request = json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": { "name": tool, "arguments": arguments },

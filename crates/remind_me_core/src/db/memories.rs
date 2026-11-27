@@ -624,14 +624,22 @@ impl<'c> Memories<'c> {
         }
     }
 
-    /// See [`MemoryStore::insert`].
+    /// See [`MemoryStore::insert`]. Counts the row for
+    /// [`crate::clients::note_write`] once it is inserted.
     pub fn insert(&self, row: &NewMemory) -> Result<()> {
-        MemoryStore::insert(&mut *self.backend.lock()?, row)
+        MemoryStore::insert(&mut *self.backend.lock()?, row)?;
+        crate::clients::note_write(&row.client);
+        Ok(())
     }
 
-    /// See [`MemoryStore::insert_or_ignore`].
+    /// See [`MemoryStore::insert_or_ignore`]. Counts the row for
+    /// [`crate::clients::note_write`] only when it was inserted.
     pub fn insert_or_ignore(&self, row: &NewMemory) -> Result<bool> {
-        MemoryStore::insert_or_ignore(&mut *self.backend.lock()?, row)
+        let inserted = MemoryStore::insert_or_ignore(&mut *self.backend.lock()?, row)?;
+        if inserted {
+            crate::clients::note_write(&row.client);
+        }
+        Ok(inserted)
     }
 
     /// See [`MemoryStore::upsert_synced`].
