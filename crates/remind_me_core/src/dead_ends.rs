@@ -194,17 +194,22 @@ pub fn rank(
 /// Live, unsuperseded, unexpired, not a dialog, sensitive only when asked,
 /// in the project scope.
 fn showable(memory: &Memory, request: &Request<'_>, now: DateTime<Utc>) -> bool {
-    let in_project = match (request.project, memory.project.as_deref()) {
-        (Some(want), Some(have)) => want.trim().eq_ignore_ascii_case(have.trim()),
-        _ => true,
-    };
     memory.memory_type.as_deref() == Some(MemoryKind::DeadEnd.as_str())
         && memory.deleted_at.is_none()
         && memory.superseded_by.is_none()
         && memory.category != crate::models::DIALOG_CATEGORY
         && (request.include_sensitive || !memory.sensitive)
         && !crate::retrieval::is_expired(now, memory.valid_until.as_deref())
-        && in_project
+        && in_project(request.project, memory)
+}
+
+/// Whether `memory` is in the `project` scope: its own project is that one
+/// (case and spaces aside) or unset. `None` admits every project.
+pub fn in_project(project: Option<&str>, memory: &Memory) -> bool {
+    match (project, memory.project.as_deref()) {
+        (Some(want), Some(have)) => want.trim().eq_ignore_ascii_case(have.trim()),
+        _ => true,
+    }
 }
 
 /// The share of `memory`'s words in `query`, when it clears the bar.

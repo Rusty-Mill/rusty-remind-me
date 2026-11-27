@@ -814,8 +814,8 @@ fn warnings_draft(found: crate::dead_ends::Found) -> Option<Draft> {
     }
     Some(Draft {
         name: "warnings",
-        // First in priority: a warning is worth more than recent activity.
-        weight: 20,
+        // Unused: warnings take what they need first (see `fit`).
+        weight: 0,
         items: found.warnings.iter().map(warning_item).collect(),
         capped: found.omitted,
     })
@@ -841,10 +841,10 @@ fn scope_warnings_draft(resolved: &[&Memory]) -> Option<Draft> {
     warnings_draft(found)
 }
 
-/// The dead ends the prompt repeats, in the hook's project (D117).
-/// The prompt hook's sections: the dead ends the prompt repeats, then its
-/// hits. Conflicts are settled over both at once, so neither section shows
-/// a claim the other's memory overrules.
+/// The prompt hook's sections: the dead ends the prompt repeats, in the
+/// hook's project (D117), then its hits. Conflicts are settled over both at
+/// once, so neither section shows a claim the other's memory overrules; dead
+/// ends are scoped first, so another project's cannot overrule ours.
 fn prompt_drafts(
     store: &Store<'_>,
     prompt: &str,
@@ -854,7 +854,7 @@ fn prompt_drafts(
     let dead_ends: Vec<Memory> = Memories::new(store)
         .live_of_type(crate::kinds::MemoryKind::DeadEnd.as_str())?
         .into_iter()
-        .filter(|m| injectable(m, now))
+        .filter(|m| injectable(m, now) && crate::dead_ends::in_project(project, m))
         .collect();
     let hits = prompt_hits(store, prompt, now)?;
     let mut pool: Vec<&Memory> = dead_ends.iter().collect();
@@ -1010,9 +1010,16 @@ fn fit_overhead(brief: &mut Brief, drafts: &[Draft]) -> Result<usize> {
     }
 }
 
+/// Whether a draft takes what it needs before the rest share by weight.
+/// Warnings do: a dead end is worth more than any other section, and its
+/// own cap keeps it small (D117).
+fn takes_first(draft: &Draft) -> bool {
+    draft.name == "warnings"
+}
+
 /// Reserve the envelope and every section's heading, then allot what is
-/// left across `drafts` in order, each a share of the remainder by its
-/// weight, and keep the items that fit.
+/// left across `drafts` in order: a draft that [`takes_first`] gets all of
+/// it, the rest a share of the remainder by weight; keep the items that fit.
 fn fit(brief: &mut Brief, drafts: Vec<Draft>) -> Result<()> {
     let limit = brief.budget.limit;
     let overhead = fit_overhead(brief, &drafts)?;
@@ -1022,6 +1029,8 @@ fn fit(brief: &mut Brief, drafts: Vec<Draft>) -> Result<()> {
     for draft in drafts {
         let allotted = if limit == 0 {
             usize::MAX
+        } else if takes_first(&draft) {
+            available - spent_total
         } else {
             (available - spent_total) * draft.weight / weight_left.max(1)
         };
