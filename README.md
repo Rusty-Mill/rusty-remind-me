@@ -457,7 +457,7 @@ window keeps one top-`limit` slot for the best hit of each non-empty bucket
 among the last 2 days, the 5 days before, and older, so heavily read old
 rows cannot crowd the newest week out of "latest on X". It reorders after
 rerank and before the cut, and otherwise keeps rank order. It is off by
-default (card #568, D134).
+default (card #568, D137).
 
 ### Event time (`metadata.occurred_at`)
 

@@ -1,6 +1,6 @@
 //! Card #568's measurement, fixture half: does recency bucketing
 //! (`REMIND_ME_TIME_BUCKETS=recency`) help? Keep rule pre-registered by Nano
-//! (pack D133): recall@10 or MRR on temporal queries rises 2+ points and no
+//! (pack D136): recall@10 or MRR on temporal queries rises 2+ points and no
 //! other kind or strategy drops more than 0.02, plus a status-question set
 //! (10+ "latest on X", clock relative to the run) where a newest-week
 //! relevant hit must reach the top 10.
@@ -44,7 +44,7 @@ use shared::*;
 
 const FLAGS: [(&str, Mode); 2] = [("off", Mode::Off), ("recency", Mode::Recency)];
 const TEMPORAL_KINDS: [&str; 3] = ["temporal", "dated", "occurred"];
-/// D133 (as D92): the lift that keeps a mode, and the drop that sinks it.
+/// D136 (as D92): the lift that keeps a mode, and the drop that sinks it.
 const KEEP_LIFT: f64 = 0.02;
 const MAX_DROP: f64 = 0.02;
 /// Searches per query, for the latency percentiles.
@@ -274,7 +274,7 @@ fn report(rows: &Rows, latency_us: &BTreeMap<String, Vec<u128>>) {
             println!("{cell:24} {strategy:17} {kind:14} recall@10 {d10:+.4}  MRR {dmrr:+.4}");
         }
     }
-    println!("\n== D133 fixture half, per flag and mode");
+    println!("\n== D136 fixture half, per flag and mode");
     for (cell, lift) in &verdict_lift {
         let drop = verdict_drop.get(cell).copied().unwrap_or(0.0);
         let keep = *lift >= KEEP_LIFT && drop >= -MAX_DROP;

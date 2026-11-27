@@ -2,11 +2,11 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
-## 2026-11-27 — Opt-in recency buckets for status questions (Mill Board #568, D132–D134)
+## 2026-11-27 — Opt-in recency buckets for status questions (Mill Board #568, D135–D137)
 
 ### Added
 - `REMIND_ME_TIME_BUCKETS=recency` (off by default): a search with no time window keeps one top-`limit` slot for the best hit of each non-empty bucket among the last 2 days, the 5 days before, and older, so heavily read old rows cannot crowd the newest week out of "latest on X". It runs after rerank and before the cut, so pages stay stable. Unset, blank or any other value is off.
-- `docs/research/568-time-buckets-spike.md`: the spike write-up. On the #59 fixture recency moved no gated query and added no latency; on a generated status set it took hit@10 from 0.02 to 1.00 (hashed mode). It missed D133's 2-point temporal lift, so it ships opt-in only (D134).
+- `docs/research/568-time-buckets-spike.md`: the spike write-up. On the #59 fixture recency moved no gated query and added no latency; on a generated status set it took hit@10 from 0.02 to 1.00 (hashed mode). It missed D136's 2-point temporal lift, so it ships opt-in only (D137).
 
 ### Not merged
 - The `window` mode (spreading a wide window across equal buckets) lowered temporal MRR by 0.025 to 0.092 and was removed.
