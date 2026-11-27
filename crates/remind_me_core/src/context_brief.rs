@@ -303,16 +303,24 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
         .into_iter()
         .filter(|m| !crate::mute::is_record(m) && !mutes.covers(m))
         .collect();
-    let in_scope: Vec<&Memory> = memories.iter().filter(|m| scope.admits(m)).collect();
+    // A dead end with no project holds everywhere, so it joins every scope
+    // (D116) and takes part in its conflicts.
+    let pool: Vec<&Memory> = memories
+        .iter()
+        .filter(|m| scope.admits(m) || (is_dead_end(m) && m.project.is_none()))
+        .collect();
     // Before any section is drafted, so none shows both sides of one claim.
-    let in_scope = without_overruled(&in_scope);
+    let resolved = without_overruled(&pool);
+    let in_scope: Vec<&Memory> = resolved
+        .iter()
+        .copied()
+        .filter(|m| scope.admits(m))
+        .collect();
     brief.project = scope.project_match(&in_scope);
 
     // Dead ends go first and only there (card #1484, D117): never again in
     // activity.
-    let mut drafts: Vec<Draft> = scope_warnings_draft(&memories, &scope)
-        .into_iter()
-        .collect();
+    let mut drafts: Vec<Draft> = scope_warnings_draft(&resolved).into_iter().collect();
     let mut rest: Vec<&Memory> = in_scope
         .iter()
         .copied()
@@ -819,18 +827,13 @@ fn warnings_draft(found: crate::dead_ends::Found) -> Option<Draft> {
     })
 }
 
-/// The scope's dead ends, newest first, not windowed (D117). `memories` are
-/// already fit to show unasked; a dead end with no project holds everywhere,
-/// so it joins every scope (D116). Conflicts are resolved over the scope plus
-/// those projectless dead ends, so a dead end a stronger statement overrules
-/// is not shown as a warning.
-fn scope_warnings_draft(memories: &[Memory], scope: &Scope) -> Option<Draft> {
-    let pool: Vec<&Memory> = memories
+/// The scope's dead ends, newest first, not windowed (D117). `resolved` is
+/// the scope plus projectless dead ends, fit to show unasked and with
+/// conflicts already settled, so an overruled dead end is not a warning.
+fn scope_warnings_draft(resolved: &[&Memory]) -> Option<Draft> {
+    let candidates: Vec<Memory> = resolved
         .iter()
-        .filter(|m| scope.admits(m) || (is_dead_end(m) && m.project.is_none()))
-        .collect();
-    let candidates: Vec<Memory> = without_overruled(&pool)
-        .into_iter()
+        .copied()
         .filter(|m| is_dead_end(m))
         .cloned()
         .collect();
