@@ -274,6 +274,7 @@ fn an_edited_imported_memory_is_still_removed() {
             project: None,
             sensitive: None,
             memory_id: "mem_edited".into(),
+            if_version: None,
             content: Some("hand-edited afterwards".into()),
             category: None,
             tags: None,

@@ -131,6 +131,17 @@ pub fn list_reminders(store: &Store<'_>, when: ReminderWindow, limit: i64) -> Re
     Reminders::new(store).in_window(when, &Utc::now().to_rfc3339(), limit)
 }
 
+/// [`list_reminders`] restricted to the memories `keep` accepts, checked
+/// before `limit` so a rejected memory never takes a slot.
+pub fn list_reminders_where(
+    store: &Store<'_>,
+    when: ReminderWindow,
+    limit: i64,
+    keep: &dyn Fn(&Memory) -> bool,
+) -> Result<Vec<Memory>> {
+    Reminders::new(store).in_window_where(when, &Utc::now().to_rfc3339(), limit, keep)
+}
+
 /// Render memories the way the reference's `_fmt_memory_md` does.
 ///
 /// Kept byte-compatible with the reference's layout — including the 2000-char

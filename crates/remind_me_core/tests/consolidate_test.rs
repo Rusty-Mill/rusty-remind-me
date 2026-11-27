@@ -400,6 +400,7 @@ fn replace_metadata(store: &Store<'_>, id: &str, metadata: serde_json::Value) {
             project: None,
             sensitive: None,
             memory_id: id.to_string(),
+            if_version: None,
             content: None,
             category: None,
             tags: None,

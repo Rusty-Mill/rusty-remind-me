@@ -155,6 +155,7 @@ fn the_flag_can_be_set_and_cleared_after_creation() {
             &MemoryUpdateInput {
                 project: None,
                 memory_id: id.clone(),
+                if_version: None,
                 clear_superseded: false,
                 content: None,
                 category: None,
@@ -186,6 +187,7 @@ fn an_update_that_does_not_mention_the_flag_leaves_it_alone() {
         &MemoryUpdateInput {
             project: None,
             memory_id: id.clone(),
+            if_version: None,
             clear_superseded: false,
             content: Some("quokka sighting, confirmed".into()),
             category: None,
@@ -214,6 +216,7 @@ fn an_update_of_only_the_flag_is_not_reported_as_no_fields() {
         &MemoryUpdateInput {
             project: None,
             memory_id: id,
+            if_version: None,
             clear_superseded: false,
             content: None,
             category: None,

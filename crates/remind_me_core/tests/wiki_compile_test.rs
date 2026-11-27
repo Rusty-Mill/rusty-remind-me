@@ -478,6 +478,7 @@ impl WikiWriter for SourceEditor<'_> {
             &self.db.store(),
             &remind_me_core::MemoryUpdateInput {
                 memory_id: "mem_a".into(),
+                if_version: None,
                 content: Some("Rust has ownership and borrowing".into()),
                 category: None,
                 tags: None,

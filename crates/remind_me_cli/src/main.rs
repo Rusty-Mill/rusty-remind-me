@@ -9,6 +9,7 @@ mod session;
 use daemon::Store;
 use remind_me_api::ApiServer;
 use remind_me_core::daemon::ops::{Op, TopicAction};
+use remind_me_core::dialog_reconcile::Report as DialogReport;
 use remind_me_core::entity::Entity;
 use remind_me_core::entity_duplicates::{self, DuplicateCandidate};
 use remind_me_core::models::{Memory, MemoryListResult, MemorySearchResult};
@@ -289,6 +290,48 @@ const ADD_USAGE: &str =
 
 const RESOLVE_USAGE: &str = "Usage: rusty-remind-me resolve <id> \
 (<done|abandoned|reverted|superseded> | --review <held|revised|reverted>) [--note TEXT]";
+
+const MUTE_USAGE: &str =
+    "Usage: rusty-remind-me <mute|unmute> <entity|topic|tag> <VALUE> [--project NAME]";
+
+/// Parsed form of `rusty-remind-me mute|unmute <target> <value> [--project NAME]`.
+#[derive(Debug, PartialEq)]
+struct MuteArgs {
+    target: String,
+    value: String,
+    project: Option<String>,
+}
+
+fn parse_mute_args(args: &[String]) -> Result<MuteArgs, String> {
+    let mut words: Vec<&String> = Vec::new();
+    let mut project = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--project" {
+            project = Some(flag_value(args, i, "--project", MUTE_USAGE)?);
+            i += 2;
+        } else if args[i].starts_with("--") {
+            return Err(format!(
+                "Error: unknown flag {:?}.\n{}",
+                args[i], MUTE_USAGE
+            ));
+        } else {
+            words.push(&args[i]);
+            i += 1;
+        }
+    }
+    match &words[..] {
+        [target, value] => {
+            check_one_of("target", target, &["entity", "topic", "tag"])?;
+            Ok(MuteArgs {
+                target: target.to_string(),
+                value: value.to_string(),
+                project,
+            })
+        }
+        _ => Err(MUTE_USAGE.to_string()),
+    }
+}
 
 const WIKI_COMPILE_USAGE: &str =
     "Usage: rusty-remind-me wiki-compile --auto [--max-batches N] [--allow-shrink]";
@@ -1120,10 +1163,15 @@ fn run_admin(db_path: &std::path::Path, rest: &[String]) -> Result<(), Box<dyn s
     };
     // Before the daemon is reached: a daemon connection carries this process's
     // value of the variable, and the admin group is hidden by default.
+    // `admin` is the person, not a client: an inherited `REMIND_ME_CLIENT`
+    // would put a registered client's narrower profile ahead of `full`.
     // Safe here, unlike in a test: this is the only thread, before the store
     // is opened, so no C code (SQLite's init) can be reading the environment.
     #[allow(clippy::disallowed_methods)]
-    env::set_var(TOOL_PROFILE_ENV, "full");
+    {
+        env::set_var(TOOL_PROFILE_ENV, "full");
+        env::remove_var("REMIND_ME_CLIENT");
+    }
     let request = json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": { "name": tool, "arguments": arguments },
@@ -1216,6 +1264,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `None` unless the store synced once: its outbox still fills and
         // nothing else drains it (ADR-0032).
         let pruner = remind_me_core::sync::retention::start_pruner_for(&db.store());
+        // One read-only pass over the dialog store, if there is one (D132);
+        // detached, since it never writes and must not hold up the server.
+        let _dialog_check = remind_me_core::dialog_reconcile::start_for(&db.store());
         let server = McpServer::new(db);
         let result = server.run_stdio_loop();
         // All joined before the database goes out of scope, so an in-flight
@@ -1700,6 +1751,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+            "mute" | "unmute" => {
+                let parsed = match parse_mute_args(&args[2..]) {
+                    Ok(parsed) => parsed,
+                    Err(message) => {
+                        eprintln!("{}", message);
+                        std::process::exit(1);
+                    }
+                };
+                let op = if args[1] == "mute" {
+                    Op::Mute {
+                        target: parsed.target,
+                        value: parsed.value.clone(),
+                        project: parsed.project,
+                    }
+                } else {
+                    Op::Unmute {
+                        target: parsed.target,
+                        value: parsed.value.clone(),
+                        project: parsed.project,
+                    }
+                };
+                let changed: serde_json::Value = Store::open(&db_path)?.call(op)?;
+                if changed.is_null() {
+                    eprintln!("Nothing mutes {}", parsed.value);
+                    std::process::exit(1);
+                }
+                println!("{}", serde_json::to_string_pretty(&changed)?);
+            }
+            "mutes" => {
+                let mutes: serde_json::Value = Store::open(&db_path)?.call(Op::Mutes)?;
+                println!("{}", serde_json::to_string_pretty(&mutes)?);
+            }
             "resolve" => {
                 let resolve = match parse_resolve_args(&args[2..]) {
                     Ok(parsed) => parsed,
@@ -1741,8 +1824,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let stats: Stats = Store::open(&db_path)?.call(Op::Stats)?;
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             }
+            "dialogs" => {
+                let full = match parse_dialogs_args(&args[2..]) {
+                    Ok(full) => full,
+                    Err(message) => {
+                        eprintln!("{message}");
+                        std::process::exit(1);
+                    }
+                };
+                let report: Option<DialogReport> =
+                    Store::open(&db_path)?.call(Op::DialogsCheck { full })?;
+                let Some(report) = report else {
+                    println!("no dialog store beside {}", db_path.display());
+                    return Ok(());
+                };
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.findings() > 0 {
+                    std::process::exit(1);
+                }
+            }
             cmd => {
-                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, admin, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, wiki-compile, topics, routing, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export, export, decisions", cmd);
+                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, admin, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, wiki-compile, topics, routing, stats, dialogs, resolve, session, capture-transcript, import-sessions, context, brief, impact-export, export, decisions", cmd);
                 std::process::exit(1);
             }
         }
@@ -1751,12 +1853,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+const DIALOGS_USAGE: &str = "usage: rusty-remind-me dialogs check [--full]";
+
+/// `dialogs check [--full]`: whether to re-hash every blob.
+fn parse_dialogs_args(args: &[String]) -> Result<bool, String> {
+    match args {
+        [check] if check == "check" => Ok(false),
+        [check, full] if check == "check" && full == "--full" => Ok(true),
+        _ => Err(DIALOGS_USAGE.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn mute_args_take_a_target_a_value_and_an_optional_project() {
+        assert_eq!(
+            parse_mute_args(&args(&["entity", "Gary", "--project", "alpha"])),
+            Ok(MuteArgs {
+                target: "entity".into(),
+                value: "Gary".into(),
+                project: Some("alpha".into()),
+            })
+        );
+        assert!(parse_mute_args(&args(&["person", "Gary"])).is_err());
+        assert!(parse_mute_args(&args(&["tag"])).is_err());
+        assert!(parse_mute_args(&args(&["tag", "x", "--loud"])).is_err());
+    }
+
+    #[test]
+    fn dialogs_check_takes_an_optional_full_flag() {
+        assert_eq!(parse_dialogs_args(&args(&["check"])), Ok(false));
+        assert_eq!(parse_dialogs_args(&args(&["check", "--full"])), Ok(true));
+        assert!(parse_dialogs_args(&args(&[])).is_err());
+        assert!(parse_dialogs_args(&args(&["check", "--fast"])).is_err());
+        assert!(parse_dialogs_args(&args(&["repair"])).is_err());
     }
 
     #[test]

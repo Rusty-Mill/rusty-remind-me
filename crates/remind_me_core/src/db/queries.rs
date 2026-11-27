@@ -58,6 +58,12 @@ pub(crate) fn add_memory_reviewing(
 ) -> Result<Memory> {
     let supersedes = input.supersedes.clone();
     check_dead_end_source(store, fields.memory_type.as_deref(), &input.metadata)?;
+    crate::mute::check_write(
+        store,
+        &input.category,
+        fields.memory_type.as_deref(),
+        &input.metadata,
+    )?;
     let add = PreparedAdd::new(input, fields, review)?;
     // With `supersedes`, one transaction: the insert, its index and every
     // retirement land together or not at all, and each target is checked
@@ -349,10 +355,60 @@ pub fn update_memory_with(
     input: &MemoryUpdateInput,
     fields: &StructuredFields,
 ) -> Result<UpdateOutcome> {
-    let Some(stored) = get_memory_by_id(store, &input.memory_id)? else {
-        return Ok(UpdateOutcome::NotFound);
-    };
-    crate::dialog::refuse_protected_edit(&stored)?;
+    update_memory_pausing(store, input, fields, &|| {})
+}
+
+/// [`update_memory_with`], calling `after_read` between reading the memory
+/// and writing it: where a concurrent writer would otherwise slip in. For
+/// tests that put one there.
+#[doc(hidden)]
+pub fn update_memory_pausing(
+    store: &Store<'_>,
+    input: &MemoryUpdateInput,
+    fields: &StructuredFields,
+    after_read: &dyn Fn(),
+) -> Result<UpdateOutcome> {
+    let expect = crate::version::Expect::parse(input.if_version.as_deref(), false)?;
+    // Read, check and write in one transaction (pack D122), so a writer
+    // holding the same version cannot land between the check and the edit.
+    let written = store.atomically(|store| -> Result<UpdateOutcome> {
+        let Some(stored) = get_memory_by_id(store, &input.memory_id)? else {
+            return Ok(UpdateOutcome::NotFound);
+        };
+        after_read();
+        crate::version::check(expect.as_ref(), Some(&crate::version::of_memory(&stored)))?;
+        write_update(store, input, fields, &stored)
+    })?;
+    if !matches!(written, UpdateOutcome::Updated(_)) {
+        return Ok(written);
+    }
+
+    // Only a content change invalidates the stored embeddings — category,
+    // tags and metadata don't change what the text means. Best-effort, same
+    // as `add_memory`: an embedding failure here does not undo the update
+    // that already committed.
+    if let Some(content) = &input.content {
+        if let Some(embedder) = crate::embedder::available_embedder() {
+            let _ = crate::vectors::embed_and_store(store, &*embedder, &input.memory_id, content);
+        }
+    }
+
+    let memory = get_memory_by_id(store, &input.memory_id)?.ok_or(StoreError::NotFound)?;
+    crate::events::emit(crate::events::Event::Updated, &memory.id, &memory.category);
+
+    Ok(UpdateOutcome::Updated(Box::new(memory)))
+}
+
+/// The checks and the edit of one update, against the row read under the
+/// same transaction. Returns `Updated` with the pre-edit row as a marker;
+/// the caller re-reads the written one.
+fn write_update(
+    store: &Store<'_>,
+    input: &MemoryUpdateInput,
+    fields: &StructuredFields,
+    stored: &crate::models::Memory,
+) -> Result<UpdateOutcome> {
+    crate::dialog::refuse_protected_edit(stored)?;
     let project = crate::context::explicit_project(input.project.as_deref())?;
     // Replacing metadata keeps the system-owned evidence count (#354), so an
     // edit can neither clobber it nor reset it under an already boosted
@@ -370,12 +426,24 @@ pub fn update_memory_with(
             .or(stored.memory_type.as_deref());
         check_dead_end_source(store, kind, metadata)?;
     }
+    // Filing a memory as a mute, or editing one, keeps it a valid mute
+    // (card #1485).
+    let category = input.category.as_deref().unwrap_or(&stored.category);
+    crate::mute::check_write(
+        store,
+        category,
+        fields
+            .memory_type
+            .as_deref()
+            .or(stored.memory_type.as_deref()),
+        metadata,
+    )?;
     // Only metadata this edit supplies: a stored value is never revalidated,
     // so an edit that leaves metadata alone cannot fail on it (pack D86).
     if let Some(supplied) = &client_metadata {
         crate::kinds::validate_occurred_at(supplied)?;
     }
-    check_persona_edit(&stored, input.category.as_deref(), metadata)?;
+    check_persona_edit(stored, input.category.as_deref(), metadata)?;
     // Becoming a decision schedules its follow-up; staying one does not.
     let scheduled = if stored.memory_type.as_deref() == Some("decision") {
         None
@@ -436,25 +504,12 @@ pub fn update_memory_with(
     };
     // The revision and the edit land together or not at all (Q21): a
     // revision without its edit would hold the current value as history.
+    // Already inside the caller's transaction, so this joins it.
     store.atomically(|store| -> Result<()> {
         crate::history::capture_revision(store, &input.memory_id, &tracked, None)?;
         Memories::new(store).apply_edit(&input.memory_id, &edit)
     })?;
-
-    // Only a content change invalidates the stored embeddings — category,
-    // tags and metadata don't change what the text means. Best-effort, same
-    // as `add_memory`: an embedding failure here does not undo the update
-    // that already committed.
-    if let Some(content) = &input.content {
-        if let Some(embedder) = crate::embedder::available_embedder() {
-            let _ = crate::vectors::embed_and_store(store, &*embedder, &input.memory_id, content);
-        }
-    }
-
-    let memory = get_memory_by_id(store, &input.memory_id)?.ok_or(StoreError::NotFound)?;
-    crate::events::emit(crate::events::Event::Updated, &memory.id, &memory.category);
-
-    Ok(UpdateOutcome::Updated(Box::new(memory)))
+    Ok(UpdateOutcome::Updated(Box::new(stored.clone())))
 }
 
 /// Delete a memory. Returns `false` if no live memory had that id.
@@ -719,6 +774,14 @@ pub fn reclassify_memories(store: &Store<'_>, input: &ReclassifyInput) -> Result
             refused.push(classification.memory_id.clone());
             continue;
         }
+        // A mute stays a preference (card #1485): another kind would drop it
+        // from the mute list silently, with no unmute in its history.
+        if stored.category == crate::mute::CATEGORY
+            && classification.memory_type != crate::mute::KIND.as_str()
+        {
+            refused.push(classification.memory_id.clone());
+            continue;
+        }
         // Becoming a decision schedules its follow-up; staying one does not.
         let metadata = if stored.memory_type.as_deref() == Some("decision") {
             None
@@ -853,7 +916,14 @@ pub fn search_memories_deadlined(
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
 ) -> Result<crate::retrieval::TrimOutcome> {
-    search_ranked(store, input, embedder, deadline, &RankOptions::default())
+    search_ranked(
+        store,
+        input,
+        embedder,
+        deadline,
+        &|_| false,
+        Default::default(),
+    )
 }
 
 /// [`search_memories_deadlined`] with card #568's recency buckets (off
@@ -865,54 +935,50 @@ pub fn search_memories_deadlined_with(
     deadline: crate::retrieval::Deadline,
     time_buckets: crate::time_buckets::Mode,
 ) -> Result<crate::retrieval::TrimOutcome> {
-    let opts = RankOptions {
-        time_buckets,
-        ..RankOptions::default()
-    };
-    search_ranked(store, input, embedder, deadline, &opts)
+    search_ranked(store, input, embedder, deadline, &|_| false, time_buckets)
 }
 
-/// [`search_memories`] with dead ends left out of both ranking lanes, before
-/// their limits, so they never take a hit's place and the candidate pool
-/// stays the size `input` asks for. For a caller that shows dead ends apart,
-/// as warnings (card #1484).
-pub fn search_memories_without_dead_ends(
+/// [`search_memories`] with the memories `skip` matches left out of both
+/// ranking lanes, before their limits, so they never take a hit's place and
+/// the candidate pool stays the size `input` asks for. For a caller that
+/// shows some memories apart or not at all, as the prompt hook does dead ends
+/// (card #1484) and muted memories (card #1485).
+pub fn search_memories_skipping(
     store: &Store<'_>,
     input: &MemorySearchInput,
+    skip: &dyn Fn(&Memory) -> bool,
 ) -> Result<Vec<MemorySearchResult>> {
     let configured = crate::embedder::available_embedder();
     let embedder = configured
         .as_ref()
         .map(|e| &**e as &dyn crate::embedder::Embedder);
     let deadline = crate::retrieval::Deadline::from_env();
-    let opts = RankOptions {
-        exclude_dead_ends: true,
-        ..RankOptions::default()
-    };
-    Ok(search_ranked(store, input, embedder, deadline, &opts)?.results)
+    Ok(search_ranked(store, input, embedder, deadline, skip, Default::default())?.results)
 }
 
-/// What [`search_ranked`] leaves out of both lanes, inside each before its
-/// limit, and how it orders the cut.
-#[derive(Debug, Clone, Default)]
-struct RankOptions {
-    /// Every dead end (card #1484).
-    exclude_dead_ends: bool,
-    /// These ids: dead ends already shown as warnings (card #1484).
-    skip_ids: std::collections::HashSet<String>,
-    /// Card #568's recency mode, applied to what is left before the cut.
-    time_buckets: crate::time_buckets::Mode,
+/// [`search_memories`] with dead ends left out of both ranking lanes, before
+/// their limits, so they never take a hit's place and the candidate pool
+/// stays the size `input` asks for. For a caller that shows dead ends apart,
+/// as warnings (card #1484). Kept as landed in #440; it is
+/// [`search_memories_skipping`] with [`crate::dead_ends::is_dead_end`].
+pub fn search_memories_without_dead_ends(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+) -> Result<Vec<MemorySearchResult>> {
+    search_memories_skipping(store, input, &crate::dead_ends::is_dead_end)
 }
 
-/// The search behind [`search_memories_deadlined`], with `opts`.
+/// The search behind [`search_memories_deadlined`]. `skip` leaves memories
+/// out of both lanes, inside each before its limit; `time_buckets` is card
+/// #568's recency mode, applied to what is left before the cut.
 fn search_ranked(
     store: &Store<'_>,
     input: &MemorySearchInput,
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
-    opts: &RankOptions,
+    skip: &dyn Fn(&Memory) -> bool,
+    time_buckets: crate::time_buckets::Mode,
 ) -> Result<crate::retrieval::TrimOutcome> {
-    let time_buckets = opts.time_buckets;
     let memories_repo = Memories::new(store);
     let mut timing = crate::retrieval::SearchTiming {
         deadline_ms: deadline.limit_ms(),
@@ -957,11 +1023,6 @@ fn search_ranked(
     // with no window either, nothing was searchable.
     // `limit` applies after `apply_validity`, so a dropped or demoted row
     // gives its place to an eligible one, as in the ranked path.
-    let skip = |m: &Memory| {
-        (opts.exclude_dead_ends && crate::dead_ends::is_dead_end(m))
-            || opts.skip_ids.contains(&m.id)
-    };
-
     if phrases.is_empty() {
         let mut dormant_excluded = 0;
         let listed = if input.window.is_unbounded() {
@@ -992,7 +1053,7 @@ fn search_ranked(
             listed
         };
         if listed.is_empty() && filter.exclude_raw && !input.window.is_unbounded() {
-            return raw_fallback(store, input, embedder, deadline, timing, opts);
+            return raw_fallback(store, input, embedder, deadline, timing, skip, time_buckets);
         }
         let mut outcome = trim_by_token_budget(listed, input.token_budget, input.detail);
         timing.elapsed_ms = deadline.elapsed_ms();
@@ -1182,7 +1243,7 @@ fn search_ranked(
     ranked.truncate(input.limit);
 
     if ranked.is_empty() && filter.exclude_raw {
-        return raw_fallback(store, input, embedder, deadline, timing, opts);
+        return raw_fallback(store, input, embedder, deadline, timing, skip, time_buckets);
     }
 
     let mut outcome = trim_by_token_budget(ranked, input.token_budget, input.detail);
@@ -1256,14 +1317,15 @@ fn raw_fallback(
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
     first: crate::retrieval::SearchTiming,
-    opts: &RankOptions,
+    skip: &dyn Fn(&Memory) -> bool,
+    time_buckets: crate::time_buckets::Mode,
 ) -> Result<crate::retrieval::TrimOutcome> {
     let raw = MemorySearchInput {
         include_raw: true,
         ..input.clone()
     };
-    // The retry keeps the caller's dead-end exclusion and recency mode.
-    let mut outcome = search_ranked(store, &raw, embedder, deadline, opts)?;
+    // The retry keeps the caller's skip and recency mode.
+    let mut outcome = search_ranked(store, &raw, embedder, deadline, skip, time_buckets)?;
     outcome.raw_fallback = !outcome.results.is_empty();
     for stage in first.skipped {
         if !outcome.timing.skipped.contains(&stage) {
@@ -1537,6 +1599,7 @@ pub fn search_with_expansions(
         inferred_window,
         warnings: found.warnings,
         warnings_omitted: found.omitted,
+        muted: muted_hits(store, input, &memories)?,
         memories,
         total_candidates: outcome.total_candidates,
         returned: outcome.returned,
@@ -1556,6 +1619,24 @@ pub fn search_with_expansions(
     Ok(response)
 }
 
+/// The ids of `hits` a mute in force covers (card #1485): global mutes,
+/// and those of the search's project.
+fn muted_hits(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+    hits: &[MemorySearchResult],
+) -> Result<std::collections::HashSet<String>> {
+    if hits.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let mutes = crate::mute::MuteSet::load(store, input.scope.project.as_deref(), None)?;
+    Ok(hits
+        .iter()
+        .filter(|r| mutes.covers(&r.memory))
+        .map(|r| r.memory.id.clone())
+        .collect())
+}
+
 /// The ranked hits less any dead end already shown as a warning (card
 /// #1484). The warned ids are left out of both lanes, before `limit`, the
 /// recency slots (card #568) and the token budget apply, so the remaining
@@ -1567,13 +1648,10 @@ fn hits_without_warned(
     warnings: &[crate::dead_ends::Warning],
     time_buckets: crate::time_buckets::Mode,
 ) -> Result<crate::retrieval::TrimOutcome> {
-    let opts = RankOptions {
-        skip_ids: warnings.iter().map(|w| w.id.clone()).collect(),
-        time_buckets,
-        ..RankOptions::default()
-    };
+    let warned: std::collections::HashSet<&str> = warnings.iter().map(|w| w.id.as_str()).collect();
+    let skip = |m: &Memory| warned.contains(m.id.as_str());
     let deadline = crate::retrieval::Deadline::from_env();
-    search_ranked(store, input, embedder, deadline, &opts)
+    search_ranked(store, input, embedder, deadline, &skip, time_buckets)
 }
 
 /// A search's dead-end warnings and the tokens they spend.

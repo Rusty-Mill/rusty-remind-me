@@ -114,6 +114,7 @@ fn a_reference_shaped_id_updates() {
         &MemoryUpdateInput {
             project: None,
             memory_id: REFERENCE_SHAPED[0].to_string(),
+            if_version: None,
             clear_superseded: false,
             content: Some("after".into()),
             category: None,
