@@ -33,7 +33,7 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use remind_me_core::db::memories::Memories;
 use remind_me_core::db::Store;
 use remind_me_core::embedder::Embedder;

@@ -414,10 +414,6 @@ pub struct MemorySearchInput {
     /// Bounded with an empty `query`, the search lists the window newest-first.
     #[serde(default, flatten)]
     pub window: crate::time_window::TimeWindow,
-    /// Time-bucket spreading (card #568 spike). Never on the wire: the search
-    /// tool sets it from `REMIND_ME_TIME_BUCKETS`, the eval harness directly.
-    #[serde(skip)]
-    pub time_buckets: crate::time_buckets::Modes,
 }
 
 impl MemorySearchInput {
@@ -497,7 +493,6 @@ impl Default for MemorySearchInput {
             include_raw: false,
             filters: SearchFilters::default(),
             window: Default::default(),
-            time_buckets: Default::default(),
         }
     }
 }

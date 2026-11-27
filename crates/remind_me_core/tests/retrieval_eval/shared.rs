@@ -313,7 +313,6 @@ pub fn ranked_outcome_with(
     time_buckets: Modes,
 ) -> (Vec<String>, bool) {
     let input = MemorySearchInput {
-        time_buckets,
         query: g.query.clone(),
         limit: DEPTH,
         token_budget: 0,
@@ -336,8 +335,14 @@ pub fn ranked_outcome_with(
     } else {
         input
     };
-    let outcome =
-        queries::search_memories_deadlined(store, &input, embedder, Deadline::unbounded()).unwrap();
+    let outcome = queries::search_memories_deadlined_with(
+        store,
+        &input,
+        embedder,
+        Deadline::unbounded(),
+        time_buckets,
+    )
+    .unwrap();
     let degraded = outcome.timing.degraded();
     let ids = outcome.results.into_iter().map(|r| r.memory.id).collect();
     (ids, degraded)

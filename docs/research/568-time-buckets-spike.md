@@ -32,9 +32,10 @@ Do the two flagged modes help enough to keep?
   `reserve_recent`) plus `Modes` and `apply`. The flag is
   `REMIND_ME_TIME_BUCKETS=off|window|recency|both`. Unset, blank or
   unrecognised means off.
-- `MemorySearchInput.time_buckets` is a `#[serde(skip)]` field, so it never
-  goes over the wire. `search_with_expansions` sets it from the flag, and the
-  harness sets it directly. The ranker applies it after fusion and rerank, on
+- `search_memories_deadlined_with` takes the modes. The search tool
+  (`search_with_expansions`) passes the flag's modes, the harness passes
+  them directly, and every other caller passes off through
+  `search_memories_deadlined`. The modes apply after fusion and rerank, on
   the whole pool, before `limit` and the token budget. With the flag off,
   nothing changes.
 - The time a row is bucketed by is `occurred_at` (a span's `to`) under

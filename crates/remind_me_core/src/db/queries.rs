@@ -797,6 +797,24 @@ pub fn search_memories_deadlined(
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
 ) -> Result<crate::retrieval::TrimOutcome> {
+    search_memories_deadlined_with(
+        store,
+        input,
+        embedder,
+        deadline,
+        crate::time_buckets::Modes::OFF,
+    )
+}
+
+/// [`search_memories_deadlined`] with card #568's time-bucket modes (a
+/// spike, off unless the search tool's flag or the eval harness sets one).
+pub fn search_memories_deadlined_with(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+    embedder: Option<&dyn crate::embedder::Embedder>,
+    deadline: crate::retrieval::Deadline,
+    time_buckets: crate::time_buckets::Modes,
+) -> Result<crate::retrieval::TrimOutcome> {
     let memories_repo = Memories::new(store);
     let mut timing = crate::retrieval::SearchTiming {
         deadline_ms: deadline.limit_ms(),
@@ -1044,10 +1062,10 @@ pub fn search_memories_deadlined(
     };
     // Card #568 spike, off unless the caller set a mode: on the whole pool,
     // after every ranking stage and before the cut, so pages stay stable.
-    if input.time_buckets != crate::time_buckets::Modes::OFF {
+    if time_buckets != crate::time_buckets::Modes::OFF {
         ranked = crate::time_buckets::apply(
             ranked,
-            input.time_buckets,
+            time_buckets,
             &input.window,
             input.limit,
             Utc::now(),
@@ -1330,18 +1348,8 @@ pub fn search_with_expansions(
     };
 
     // Card #568 spike: the search tool reads its setting here, like date
-    // phrases; the ranker itself only follows the input.
-    let modes = crate::time_buckets::Modes::from_env();
-    let bucketed;
-    let input = if modes == crate::time_buckets::Modes::OFF {
-        input
-    } else {
-        bucketed = MemorySearchInput {
-            time_buckets: modes,
-            ..input.clone()
-        };
-        &bucketed
-    };
+    // phrases; the ranker itself only follows what it is passed.
+    let time_buckets = crate::time_buckets::Modes::from_env();
 
     let configured = crate::embedder::available_embedder();
 
@@ -1377,12 +1385,14 @@ pub fn search_with_expansions(
         &hit_input
     };
 
-    let outcome = search_memories_budgeted(
+    let outcome = search_memories_deadlined_with(
         store,
         hit_input,
         configured
             .as_ref()
             .map(|e| &**e as &dyn crate::embedder::Embedder),
+        crate::retrieval::Deadline::from_env(),
+        time_buckets,
     )?;
     let memories = outcome.results;
     let ids: Vec<String> = memories.iter().map(|r| r.memory.id.clone()).collect();
