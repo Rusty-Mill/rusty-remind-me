@@ -915,7 +915,7 @@ pub fn search_memories_deadlined_with(
             listed
         };
         if listed.is_empty() && filter.exclude_raw && !input.window.is_unbounded() {
-            return raw_fallback(store, input, embedder, deadline, timing);
+            return raw_fallback(store, input, embedder, deadline, timing, time_buckets);
         }
         let mut outcome = trim_by_token_budget(listed, input.token_budget, input.detail);
         timing.elapsed_ms = deadline.elapsed_ms();
@@ -1102,7 +1102,7 @@ pub fn search_memories_deadlined_with(
     ranked.truncate(input.limit);
 
     if ranked.is_empty() && filter.exclude_raw {
-        return raw_fallback(store, input, embedder, deadline, timing);
+        return raw_fallback(store, input, embedder, deadline, timing, time_buckets);
     }
 
     let mut outcome = trim_by_token_budget(ranked, input.token_budget, input.detail);
@@ -1176,12 +1176,15 @@ fn raw_fallback(
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
     first: crate::retrieval::SearchTiming,
+    time_buckets: crate::time_buckets::Mode,
 ) -> Result<crate::retrieval::TrimOutcome> {
     let raw = MemorySearchInput {
         include_raw: true,
         ..input.clone()
     };
-    let mut outcome = search_memories_deadlined(store, &raw, embedder, deadline)?;
+    // The retry keeps the caller's recency mode (card #568).
+    let mut outcome =
+        search_memories_deadlined_with(store, &raw, embedder, deadline, time_buckets)?;
     outcome.raw_fallback = !outcome.results.is_empty();
     for stage in first.skipped {
         if !outcome.timing.skipped.contains(&stage) {
