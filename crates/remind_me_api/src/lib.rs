@@ -236,9 +236,13 @@ impl ApiServer {
             }
         }
 
+        let mut credential = None;
         if request.path.starts_with("/api/") {
-            if let Some(response) = check_auth(&request, api_key_digest) {
-                return http::write_response_cors(stream, response.0, response.1, cors);
+            match check_auth(&request, api_key_digest) {
+                Ok(key) => credential = key.map(remind_me_core::clients::Credential::ApiKey),
+                Err((status, body)) => {
+                    return http::write_response_cors(stream, status, body, cors)
+                }
             }
             if MUTATING_METHODS.contains(&request.method.as_str()) {
                 let content_type = request.content_type.split(';').next().unwrap_or("").trim();
@@ -253,11 +257,15 @@ impl ApiServer {
             }
         }
 
-        let (status, body) = if request.path == AUTO_COMPILE_PATH {
-            self.auto_compile(&request)
-        } else {
-            self.dispatch(&request)
-        };
+        // The verified key's name is this call's credential: the client
+        // registry may map it to a client id (ADR-0028 §1).
+        let (status, body) = remind_me_core::sync::with_call_credential(credential, || {
+            if request.path == AUTO_COMPILE_PATH {
+                self.auto_compile(&request)
+            } else {
+                self.dispatch(&request)
+            }
+        });
         http::write_response_cors(stream, status, body, cors)
     }
 
@@ -315,59 +323,54 @@ impl ApiServer {
     }
 }
 
-/// `None` when the request may proceed; `Some((status, body))` with the
-/// response to send otherwise.
-fn check_auth(request: &http::Request, api_key_digest: Option<&str>) -> Option<(u16, Body)> {
-    match api_key_digest {
-        Some(expected) => {
-            let presented = request.authorization.strip_prefix("Bearer ").map(digest);
-            if presented.is_some_and(|got| constant_time_eq(got.as_bytes(), expected.as_bytes())) {
-                // The flat key is always read-write, exactly as it was
-                // before scopes existed. Adding scopes must not
-                // retroactively restrict a deployment already relying on
-                // it.
-                return None;
-            }
-
-            // A named, scope-limited key (issue #120). Checked only after
-            // the flat key misses, so the common path is one comparison.
-            if let Some(presented) =
-                rusty_oauth::bearer::token_from_authorization(&request.authorization)
-            {
-                if let Some(verified) = remind_me_core::api_keys::verify(presented) {
-                    if verified.may_use(&request.method) {
-                        return None;
-                    }
-                    // 403, not 401: the key is genuine and was
-                    // authenticated. Answering 401 would send the holder
-                    // looking for a credentials problem they do not have.
-                    return Some((
-                        403,
-                        Body::Json(json!({
-                            "error": format!(
-                                "API key '{}' is read-only (scope=read); {} requires a read-write key",
-                                verified.name, request.method
-                            )
-                        })),
-                    ));
-                }
-            }
-
-            Some((401, Body::Json(json!({ "error": "Unauthorized" }))))
+/// `Ok` with the verified key's name (`None` when no key is configured and
+/// the request may proceed unauthenticated), or `Err((status, body))` with
+/// the response to send.
+fn check_auth(
+    request: &http::Request,
+    api_key_digest: Option<&str>,
+) -> Result<Option<String>, (u16, Body)> {
+    let Some(expected) = api_key_digest else {
+        if MUTATING_METHODS.contains(&request.method.as_str()) {
+            return Err((
+                401,
+                Body::Json(json!({
+                    "error": "unauthenticated write access is disabled; set REMIND_ME_API_KEY to enable it"
+                })),
+            ));
         }
-        None => {
-            if MUTATING_METHODS.contains(&request.method.as_str()) {
-                Some((
-                    401,
-                    Body::Json(json!({
-                        "error": "unauthenticated write access is disabled; set REMIND_ME_API_KEY to enable it"
-                    })),
-                ))
-            } else {
-                None
-            }
-        }
+        return Ok(None);
+    };
+    let presented = request.authorization.strip_prefix("Bearer ").map(digest);
+    if presented.is_some_and(|got| constant_time_eq(got.as_bytes(), expected.as_bytes())) {
+        // The flat key is always read-write, exactly as it was before
+        // scopes existed. Adding scopes must not retroactively restrict a
+        // deployment already relying on it.
+        return Ok(Some(remind_me_core::api_keys::DEFAULT_KEY_NAME.to_string()));
     }
+
+    // A named, scope-limited key (issue #120). Checked only after the flat
+    // key misses, so the common path is one comparison.
+    let verified = rusty_oauth::bearer::token_from_authorization(&request.authorization)
+        .and_then(remind_me_core::api_keys::verify);
+    let Some(verified) = verified else {
+        return Err((401, Body::Json(json!({ "error": "Unauthorized" }))));
+    };
+    if verified.may_use(&request.method) {
+        return Ok(Some(verified.name));
+    }
+    // 403, not 401: the key is genuine and was authenticated. Answering 401
+    // would send the holder looking for a credentials problem they do not
+    // have.
+    Err((
+        403,
+        Body::Json(json!({
+            "error": format!(
+                "API key '{}' is read-only (scope=read); {} requires a read-write key",
+                verified.name, request.method
+            )
+        })),
+    ))
 }
 
 fn resolve_api_key() -> Option<String> {

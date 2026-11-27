@@ -413,3 +413,28 @@ fn an_unknown_key_is_401_while_a_scoped_refusal_is_403() {
     );
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+#[test]
+fn a_registered_key_name_stamps_its_client() {
+    let _guard = env_lock().lock().unwrap();
+    let store = Store::new("registry");
+    let registry = store.0.with_file_name("clients.json");
+    std::fs::write(&registry, r#"{ "dashboard": { "api_keys": ["writer"] } }"#).unwrap();
+    crate::test_env::set_var(remind_me_core::clients::CLIENTS_FILE_ENV, &registry);
+    let rw_key = api_keys::create_key("writer", SCOPE_READ_WRITE).unwrap();
+    let (srv, root) = authed_server("keys-registry");
+
+    let response = call(
+        &srv,
+        "POST",
+        "/api/memories",
+        Some(&bearer(&rw_key)),
+        Some("application/json"),
+        r#"{"content":"written by a registered key"}"#,
+    );
+
+    crate::test_env::remove_var(remind_me_core::clients::CLIENTS_FILE_ENV);
+    assert!(response.status < 300, "{}", response.status);
+    assert_eq!(response.json()["client"], "dashboard");
+    std::fs::remove_dir_all(&root).unwrap();
+}

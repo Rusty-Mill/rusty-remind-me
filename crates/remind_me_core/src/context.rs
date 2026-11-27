@@ -354,7 +354,14 @@ pub struct Provenance {
     pub written_by: String,
     pub capture_method: String,
     pub context: WriteContext,
+    /// The raw MCP handshake identity (`name/version`), kept in
+    /// `metadata.client_app` because `client` names the registered caller,
+    /// not the app (ADR-0028 §1).
+    pub client_app: Option<String>,
 }
+
+/// The `metadata` key [`Provenance::client_app`] is stored under.
+pub const CLIENT_APP_KEY: &str = "client_app";
 
 impl Provenance {
     /// Stamp `row`. The context fills only the columns it knows
@@ -365,6 +372,29 @@ impl Provenance {
         row.written_by.clone_from(&self.written_by);
         row.capture_method.clone_from(&self.capture_method);
         self.context.apply(row);
+        self.apply_client_app(row);
+    }
+
+    fn apply_client_app(&self, row: &mut NewMemory) {
+        row.metadata = self.metadata(std::mem::take(&mut row.metadata));
+    }
+
+    /// `metadata` with the handshake recorded under [`CLIENT_APP_KEY`],
+    /// unless it already holds one or is not an object. For write paths
+    /// that set `metadata` over a [`Provenance::stamp`]ed base, which would
+    /// otherwise drop it.
+    pub fn metadata(&self, mut metadata: serde_json::Value) -> serde_json::Value {
+        let Some(app) = self.client_app.as_deref() else {
+            return metadata;
+        };
+        if metadata.is_null() {
+            metadata = serde_json::Value::Object(serde_json::Map::new());
+        }
+        if let Some(map) = metadata.as_object_mut() {
+            map.entry(CLIENT_APP_KEY)
+                .or_insert_with(|| serde_json::Value::String(app.to_string()));
+        }
+        metadata
     }
 
     /// The same, marked as captured by a machine (`capture_method = auto`):
@@ -397,6 +427,7 @@ pub fn provenance(writer: &Writer) -> Provenance {
         ),
         capture_method: capture_method_for(writer).to_string(),
         context: current(),
+        client_app: crate::sync::handshake_client(),
     }
 }
 
@@ -793,6 +824,7 @@ mod tests {
                 git_branch: Some("b".into()),
                 ..WriteContext::default()
             },
+            client_app: Some("hermes/0.9".into()),
         };
         let row = p.stamp(NewMemory::new("mem_1", "text", "2026-01-01T00:00:00Z"));
         assert_eq!(row.node_id.as_deref(), Some("n1"));
@@ -802,5 +834,25 @@ mod tests {
         assert_eq!(row.project.as_deref(), Some("p"));
         assert_eq!(row.git_branch.as_deref(), Some("b"));
         assert_eq!(row.cwd, None);
+        assert_eq!(row.metadata[CLIENT_APP_KEY], "hermes/0.9");
+    }
+
+    #[test]
+    fn client_app_never_overwrites_and_skips_non_objects() {
+        let p = Provenance {
+            client_app: Some("app/1".into()),
+            ..importer_provenance("x")
+        };
+        let kept = p.metadata(serde_json::json!({ CLIENT_APP_KEY: "mine" }));
+        assert_eq!(kept[CLIENT_APP_KEY], "mine");
+        assert_eq!(p.metadata(serde_json::json!([1])), serde_json::json!([1]));
+        let none = Provenance {
+            client_app: None,
+            ..p
+        };
+        assert_eq!(
+            none.metadata(serde_json::Value::Null),
+            serde_json::Value::Null
+        );
     }
 }

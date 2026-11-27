@@ -451,7 +451,7 @@ pub const CAPTURE_TOOL: &str = "remind_me_capture_transcript";
 /// The client name the remote gate gives every session opened with the
 /// capture-only credential (ADR-0036, D67): the mark on its writes, and the
 /// caller [`capture_caller_call`] lets reach [`CAPTURE_TOOL`].
-pub const CAPTURE_CLIENT: &str = "remind-me-capture-token";
+pub use remind_me_core::clients::CAPTURE_CLIENT;
 
 /// Whether this call is the capture-only caller calling [`CAPTURE_TOOL`],
 /// which it may do under any tool profile (D68). The tool stays out of
@@ -746,7 +746,7 @@ impl McpServer {
                                                 "required": ["name"]
                                             }
                                         },
-                                        "memory_type": { "type": "string", "enum": ["decision", "action_item", "preference", "fact", "reference", "insight", "learning", "blocker", "work_log", "unclassified"], "description": "What kind of memory this is; a decision requires metadata.rationale." },
+                                        "memory_type": { "type": "string", "enum": ["decision", "action_item", "preference", "fact", "reference", "insight", "learning", "blocker", "work_log", "dead_end", "unclassified"], "description": "What kind of memory this is; a decision requires metadata.rationale, a dead_end metadata.tried and metadata.why_failed." },
                                         "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 1, "description": "How far to trust this memory; scales its search ranking." },
                                         "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold; omit for always." },
                                         "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
@@ -807,7 +807,7 @@ impl McpServer {
                                         "metadata": { "type": "object" },
                                         "sensitive": { "type": "boolean", "description": "Set or clear the sensitive flag. Omit to leave it unchanged." },
                                         "clear_superseded": { "type": "boolean", "default": false, "description": "Clear this memory's superseded_by flag, un-hiding it from search, entity, and subject/predicate lookups. Recovery path for a false-positive contradiction-supersession. Does not affect the memory that did the superseding." },
-                                        "memory_type": { "type": "string", "enum": ["decision", "action_item", "preference", "fact", "reference", "insight", "learning", "blocker", "work_log", "unclassified"], "description": "Reclassify; a decision requires metadata.rationale (in this call or already stored)." },
+                                        "memory_type": { "type": "string", "enum": ["decision", "action_item", "preference", "fact", "reference", "insight", "learning", "blocker", "work_log", "dead_end", "unclassified"], "description": "Reclassify; a decision requires metadata.rationale (in this call or already stored)." },
                                         "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "How far to trust this memory; scales its search ranking." },
                                         "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold." },
                                         "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
@@ -3602,10 +3602,24 @@ impl McpServer {
                         };
                         match resolved {
                             Ok(Some((mem, done))) => {
-                                json!({ "content": [{ "type": "text", "text": match format {
-                                    ResponseFormat::Json => serde_json::to_string_pretty(&mem).unwrap(),
-                                    ResponseFormat::Markdown => format!("✓ Memory `{}` {}.", mem.id, done),
-                                } }] })
+                                let hint = outcome.and_then(|o| {
+                                    remind_me_core::resolve::dead_end_hint(o, &mem.id)
+                                });
+                                let text = match format {
+                                    ResponseFormat::Json => {
+                                        let mut body = json!(mem);
+                                        if let Some(hint) = &hint {
+                                            body["dead_end_hint"] = json!(hint);
+                                        }
+                                        serde_json::to_string_pretty(&body).unwrap_or_default()
+                                    }
+                                    ResponseFormat::Markdown => {
+                                        let tail =
+                                            hint.map(|h| format!("\n\n{h}")).unwrap_or_default();
+                                        format!("✓ Memory `{}` {}.{tail}", mem.id, done)
+                                    }
+                                };
+                                json!({ "content": [{ "type": "text", "text": text }] })
                             }
                             Ok(None) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Memory `{}` not found", memory_id) }] })

@@ -1,6 +1,8 @@
 # ADR-0028: One contract for every client
 
-Status: Accepted (2026-10-26); not yet implemented
+Status: Accepted (2026-10-26); step 1 done, step 2 in part (registry, resolution,
+`client_app`, `unknown` counter, #1552; the `client` filter and OAuth client ids are
+still to do, D107-D108)
 Date: 2026-10-26
 
 ## Context

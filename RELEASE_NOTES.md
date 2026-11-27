@@ -11,6 +11,36 @@ Dated entries, newest first. One entry per merged pull request.
 ### Not merged
 - The `window` mode (spreading a wide window across equal buckets) lowered temporal MRR by 0.025 to 0.092 and was removed.
 
+## 2026-11-27 — Dead ends that warn before they're repeated (Mill Board #1484, D115-D117, D123)
+
+### Added
+- `memory_type: dead_end`: an approach that was tried and failed. `metadata.tried` and `metadata.why_failed` are required (non-empty, at most 1,000 characters); `cost` is optional (positive minutes, or `low`/`medium`/`high`); `from` is optional and must name a live memory. Decay 0.03, type prior 1.1. Nothing existing is reclassified.
+- `warnings` and `warnings_omitted` on `remind_me_search` (MCP only; the REST search page is unchanged): up to 3 dead ends the query repeats, outside the ranking and `limit`, within a quarter of the token budget. Matching is lexical (at least half of the dead end's words, and at least 2, appear in the query; stopwords and words under 3 characters ignored), in the request's project or with none, never sensitive unless asked. A warned dead end is left out of that response's hits. Markdown shows a "Dead ends" block above the hits; compact JSON cuts `tried`/`why_failed` to 200 characters.
+- A `warnings` section first in the project and session briefs (the scope's dead ends plus projectless ones, newest first, up to 3; no longer repeated in activity) and in the prompt hook's brief (dead ends the prompt repeats in its project or with none, up to 2, inside the same 750-token budget; dead ends no longer take slots from the hook's ordinary hits; the hook script is unchanged). Warnings take the budget they need before the other sections share the rest, and a dead end that a stronger memory in its scope (its project or none) overrules is not shown.
+- `remind_me_resolve` with `abandoned` or `reverted` adds `dead_end_hint` (JSON) or a closing line (Markdown) suggesting a dead end with `from` set. Nothing is created automatically.
+
+### Not done
+- No PreToolUse blocking hook (D117: worth adding if repeats persist despite warnings, or once dead ends record an exact command or path). Semantic matching is Q29.
+
+### Tests
+- Field validation and `from`; match, no match, other project, sensitive, cap and `limit` on search; the project brief's section and its absence from activity; the prompt hook's match, miss and cap; a long warning in a tight budget; another project's dead end or fact not silencing ours; many dead ends not crowding ordinary hits out of the prompt hook; resolve's hint; MCP Markdown and compact JSON.
+
+## 2026-11-27 — Client registry: who is calling, by a stable id (Mill Board #1552 PR A, ADR-0028 step 2, D106-D109)
+
+### Added
+- `clients.json` beside the store (`REMIND_ME_CLIENTS_FILE` overrides): registered client ids (`[a-z0-9-]{1,40}`, `unknown` reserved) with handshake `aliases`, `oauth_clients` and REST `api_keys` names. A bad id, unknown field, blank value or a value claimed by two clients makes the file unusable, with the reason.
+- With a valid registry, `client` resolves credential > `REMIND_ME_CLIENT` > registered handshake alias (the name before `/`, exactly) > `unknown`, so several bots on one MCP SDK are told apart. The raw handshake is kept in `metadata.client_app` on add, auto_capture and decompose; a value the caller set is never overwritten.
+- REST: the verified API key's name (`default` for the flat key) is the call's credential.
+- `remind_me_server_status` gains a `clients` block: `registry` (`off`, `unusable`, `ready`), `path`, `reason`, `registered`, `unknown_writes` (memory rows this process inserted as `unknown`) and `counting_since`.
+
+### Unchanged
+- With no `clients.json` (every install today) the old rule holds: handshake, then `REMIND_ME_CLIENT`, then `unknown`. Deploying changes no stamped value until the file is written.
+- The capture-only credential's pinned name still stamps `client` in every registry state (D67).
+- Not yet: the `client` filter on search (needs Nano's OK, D108) and OAuth client ids (D107). No schema change or migration.
+
+### Tests
+- Each resolution tier and registry state, the capture pin, invalid files; alias to id with `client_app` stored; env beats handshake; strangers counted as unknown; a registered API key name stamps its client over REST.
+
 ## 2026-11-27 — Pinnable persona card (Mill Board #1555, D101, D102)
 
 ### Added
