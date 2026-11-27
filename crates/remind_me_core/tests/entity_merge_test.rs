@@ -519,3 +519,40 @@ fn a_name_met_through_an_alias_never_fills_the_kind() {
     assert_eq!(hit.id, a.id);
     assert_eq!(hit.kind, None);
 }
+
+#[test]
+fn a_mute_on_the_absorbed_entity_still_covers_facts_naming_it() {
+    // Codex on #437: a fact naming B only in subject or object, with no
+    // entity link, stopped being muted once B merged into A.
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    entity(&store, "Gareth", Some("person"), &[]);
+    entity(&store, "Gary", Some("person"), &[]);
+    let fact = queries::add_memory(
+        &store,
+        MemoryAddInput {
+            content: "wants the numbers redone".into(),
+            category: "general".into(),
+            source: "manual".into(),
+            subject: Some("Gary".into()),
+            predicate: Some("wants".into()),
+            object: Some("numbers redone".into()),
+            extract: false,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .id;
+    remind_me_core::mute::mute(&store, remind_me_core::mute::Target::Entity, "Gary", None).unwrap();
+    let covered = |store: &Store<'_>| {
+        let memory = queries::get_memory_by_id(store, &fact).unwrap().unwrap();
+        remind_me_core::mute::MuteSet::load(store, None, None)
+            .unwrap()
+            .covers(&memory)
+    };
+    assert!(covered(&store));
+
+    entity_merge::merge(&store, "Gary", "Gareth").unwrap();
+
+    assert!(covered(&store));
+}

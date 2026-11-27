@@ -366,7 +366,7 @@ fn set_on(store: &Store<'_>, existing: &Mute, on: bool) -> Result<Mute> {
 /// The memories the mutes in force cover, read once per brief or search.
 #[derive(Debug, Clone, Default)]
 pub struct MuteSet {
-    /// Normalized entity names, for subject and object.
+    /// Normalized entity names and aliases, for subject and object.
     entity_names: HashSet<String>,
     /// Memories linked to a muted entity or in a muted topic subtree.
     linked: HashSet<String>,
@@ -420,7 +420,12 @@ impl MuteSet {
                 }
                 self.linked
                     .extend(Memories::new(store).linked_ids(&entity.id)?);
-                self.entity_names.insert(name);
+                // Aliases too: a merge (card #567) moves the absorbed name
+                // here, and facts naming it in subject or object stay muted.
+                self.entity_names.extend(
+                    std::iter::once(name)
+                        .chain(entity.aliases.iter().map(|a| normalize_entity_name(a))),
+                );
             }
             Target::Topic => {
                 if let Ok(members) = check_topic(store, &spec.value) {
