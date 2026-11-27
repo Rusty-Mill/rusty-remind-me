@@ -134,11 +134,13 @@ impl VectorStore for SqliteTables {
         }
         let rows = rows_where(&self.conn, &clause, "created_at, id", &bind)?;
         let mut candidates = Vec::new();
-        // Dialogs (D13) and project claims (ADR-0027) are never merged.
+        // Dialogs (D13), project claims (ADR-0027) and pinned persona lines
+        // (pack D102) are never merged.
         for row in rows.into_iter().filter(|r| {
             !r.predicate
                 .as_deref()
                 .is_some_and(crate::project::is_reserved_predicate)
+                && !crate::kinds::is_pinned_persona(&r.category, r.metadata_value().as_ref())
         }) {
             if candidates.len() >= n {
                 break;
