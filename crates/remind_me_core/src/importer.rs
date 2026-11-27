@@ -26,7 +26,7 @@ use crate::db::imports::ImportLedger;
 use crate::db::memories::{Memories, NewMemory};
 use crate::db::Result;
 use crate::db::Store;
-use crate::entity::{upsert_entity, upsert_entity_relation};
+use crate::entity::upsert_entity_relation;
 use crate::import_paths::{
     suffix_of, validate_import_dir, validate_import_file, AUDIO_SUFFIXES, DOCUMENT_SUFFIXES,
     IMAGE_SUFFIXES, SUPPORTED_SUFFIXES,
@@ -1041,7 +1041,7 @@ pub fn restore_graph_records(
             }
             _ => Vec::new(),
         };
-        upsert_entity(
+        crate::entity::upsert_entity_exact(
             store,
             &EntityInput {
                 name: name.to_string(),
@@ -1507,15 +1507,15 @@ pub fn import_content(
         // resolves exactly like any other.
         if let Some(mentions) = chunk_extras.map(|e| &e.mention_entities) {
             for title in mentions {
-                let entity = upsert_entity(
+                crate::entity::mention(
                     store,
+                    &memory_id,
                     &EntityInput {
                         name: title.clone(),
                         kind: None,
                         aliases: Vec::new(),
                     },
                 )?;
-                crate::entity::link_memory_entity(store, &memory_id, &entity.id)?;
             }
         }
     }

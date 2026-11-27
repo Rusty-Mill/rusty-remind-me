@@ -71,6 +71,52 @@ pub struct EntityInput {
     pub aliases: Vec<String>,
 }
 
+/// `remind_me_entity_upsert`'s arguments: an entity to create or update, or,
+/// with `merge_into` or `revert_merge`, a person-confirmed merge or its undo
+/// (card #567, pack D114).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct EntityUpsertInput {
+    #[serde(flatten)]
+    pub entity: EntityInput,
+    /// Merge the entity `name` into this one: a preview unless `confirm`.
+    #[serde(default)]
+    pub merge_into: Option<String>,
+    /// Apply the merge `merge_into` previews.
+    #[serde(default)]
+    pub confirm: bool,
+    /// Undo the merge this record id names; `name` must be the entity it
+    /// absorbed.
+    #[serde(default)]
+    pub revert_merge: Option<String>,
+}
+
+/// What one `remind_me_entity_upsert` call asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntityUpsertAction<'a> {
+    Upsert(&'a EntityInput),
+    Preview { from: &'a str, into: &'a str },
+    Merge { from: &'a str, into: &'a str },
+    Revert { record_id: &'a str, from: &'a str },
+}
+
+impl EntityUpsertInput {
+    /// The one action these arguments name, or why they name none.
+    pub fn action(&self) -> Result<EntityUpsertAction<'_>, &'static str> {
+        let from = self.entity.name.as_str();
+        let extra = self.entity.kind.is_some() || !self.entity.aliases.is_empty();
+        match (&self.merge_into, &self.revert_merge) {
+            (Some(_), Some(_)) => Err("merge_into and revert_merge cannot be combined"),
+            (None, None) if self.confirm => Err("confirm applies only with merge_into"),
+            (None, None) => Ok(EntityUpsertAction::Upsert(&self.entity)),
+            _ if extra => Err("kind and aliases cannot be combined with a merge or its revert"),
+            (Some(into), None) if self.confirm => Ok(EntityUpsertAction::Merge { from, into }),
+            (Some(into), None) => Ok(EntityUpsertAction::Preview { from, into }),
+            (None, Some(_)) if self.confirm => Err("confirm applies only with merge_into"),
+            (None, Some(record_id)) => Ok(EntityUpsertAction::Revert { record_id, from }),
+        }
+    }
+}
+
 /// Core Memory data structure stored in SQLite.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {

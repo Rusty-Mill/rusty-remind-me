@@ -475,6 +475,10 @@ impl EntityStore for SqliteTables {
         })
     }
 
+    fn delete_relation(&mut self, id: &str) -> Result<bool> {
+        Ok(self.exec("DELETE FROM entity_relations WHERE id = ?1", [id])? > 0)
+    }
+
     fn relations_touching(
         &self,
         entity_ids: &[String],
