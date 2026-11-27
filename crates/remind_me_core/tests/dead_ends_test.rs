@@ -474,3 +474,39 @@ fn another_projects_dead_end_does_not_silence_a_prompt_warning() {
     );
     assert_eq!(section(&b, "warnings"), ["ours"]);
 }
+
+#[test]
+fn another_projects_fact_does_not_silence_a_prompt_warning() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let at = chrono::Utc::now().to_rfc3339();
+    let mut ours = NewMemory::new("ours", TRIED, &at);
+    ours.memory_type = "dead_end".into();
+    ours.metadata = json!({ "tried": TRIED, "why_failed": "segfaults" });
+    ours.subject = Some("musl build".into());
+    ours.predicate = Some("allocator".into());
+    ours.object = Some("not jemalloc".into());
+    ours.confidence = 0.4;
+    ours.project = Some("alpha".into());
+    Memories::new(&store).insert(&ours).unwrap();
+    let mut theirs = NewMemory::new(
+        "theirs",
+        "rebuild the musl target with jemalloc: it works",
+        &at,
+    );
+    theirs.memory_type = "fact".into();
+    theirs.subject = Some("musl build".into());
+    theirs.predicate = Some("allocator".into());
+    theirs.object = Some("jemalloc".into());
+    theirs.project = Some("beta".into());
+    Memories::new(&store).insert(&theirs).unwrap();
+
+    let b = brief(
+        &store,
+        Mode::Prompt,
+        Some("alpha"),
+        Some("rebuild musl with jemalloc"),
+    );
+    // Beta's fact may still show as a hit: prompt hits span projects.
+    assert_eq!(section(&b, "warnings"), ["ours"]);
+}
