@@ -925,6 +925,8 @@ fn search_ranked(
     // with no window either, nothing was searchable.
     // `limit` applies after `apply_validity`, so a dropped or demoted row
     // gives its place to an eligible one, as in the ranked path.
+    let skip = |m: &Memory| exclude_dead_ends && crate::dead_ends::is_dead_end(m);
+
     if phrases.is_empty() {
         let mut dormant_excluded = 0;
         let listed = if input.window.is_unbounded() {
@@ -939,6 +941,7 @@ fn search_ranked(
                     ..filter.clone()
                 })?
                 .into_iter()
+                .filter(|m| !skip(m))
                 .partition(|m| filter.vital_enough(m, now));
             dormant_excluded = dormant
                 .iter()
@@ -966,7 +969,6 @@ fn search_ranked(
     // `RrfFusion::Score` mode needs the raw BM25 magnitude alongside each hit.
     let mut keyword_memories = Vec::new();
     let mut keyword_bm25 = std::collections::HashMap::new();
-    let skip = |m: &Memory| exclude_dead_ends && crate::dead_ends::is_dead_end(m);
     for (memory, bm25_score) in
         memories_repo.keyword_hits_skipping(&phrases, &filter, input.limit * 2, &skip)?
     {
