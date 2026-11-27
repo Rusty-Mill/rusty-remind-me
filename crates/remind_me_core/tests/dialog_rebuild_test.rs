@@ -1,5 +1,9 @@
 //! The dialog rebuild check (#528, D133): replays dialogs from their
 //! archived sources into a scratch store and compares, read only.
+//!
+//! Unix only: elsewhere the owner-only scratch is refused (a unit test in
+//! `dialog_rebuild` covers that).
+#![cfg(unix)]
 
 #[path = "../src/test_env.rs"]
 mod test_env;
@@ -191,6 +195,11 @@ fn a_changed_message_tools_setting_is_a_mismatch_and_named() {
         report.kept && scratch.exists(),
         "a failing check keeps its scratch"
     );
+    // It holds conversation bodies: owner-only, and everything in it is
+    // reached through it.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
     done(&dir);
 }
 

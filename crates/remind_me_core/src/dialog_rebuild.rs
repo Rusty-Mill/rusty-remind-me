@@ -18,6 +18,7 @@
 //! now; no row records their value at capture (Q36), so the report names
 //! both.
 
+use crate::archive::SpanRead;
 use crate::blobs::BlobStore;
 use crate::db::dialogs::{DialogLog, DialogStore, NewDialog};
 use crate::db::memories::Memories;
@@ -50,6 +51,10 @@ pub struct Report {
     /// First rows cut to `MAX_DIALOG_CHARS` whose source holds a
     /// redaction: the cut cannot be placed again, so they are not replayed.
     pub cut_after_redaction: u64,
+    /// Rows whose recorded span is not read (inverted, outside its blob, or
+    /// over `archive::MAX_SPAN_BYTES`), each with the reason. Listed for a
+    /// look, not counted as findings.
+    pub unsupported_span: Vec<String>,
     /// Replayed rows the dialog store does not hold.
     pub not_in_store: u64,
     /// Bodies that a scrub would still change.
@@ -92,8 +97,9 @@ pub fn default_scratch(store: &Store<'_>) -> Option<PathBuf> {
 ///
 /// # Errors
 ///
-/// [`StoreError`] if `scratch` exists or cannot be made, or a store cannot
-/// be read.
+/// [`StoreError`] if `scratch` exists or cannot be made owner-only (on a
+/// platform other than Unix it is refused: see [`private_dir`]), or a store
+/// cannot be read.
 pub fn check(store: &Store<'_>, scratch: Option<&Path>, keep: bool) -> Result<Report> {
     let scratch = match scratch {
         Some(dir) => dir.to_path_buf(),
@@ -101,8 +107,7 @@ pub fn check(store: &Store<'_>, scratch: Option<&Path>, keep: bool) -> Result<Re
             StoreError::Engine("an in-memory database needs an explicit scratch".into())
         })?,
     };
-    // Never into an existing directory: its rows would mix with the replay.
-    std::fs::create_dir(&scratch)
+    private_dir(&scratch)
         .map_err(|e| StoreError::Engine(format!("scratch {}: {e}", scratch.display())))?;
     let mut report = rebuild(store, &scratch)?;
     report.kept = keep || report.findings() > 0;
@@ -116,6 +121,34 @@ pub fn check(store: &Store<'_>, scratch: Option<&Path>, keep: bool) -> Result<Re
         }
     }
     Ok(report)
+}
+
+/// Make `dir`, which must not exist (its rows would mix with the replay),
+/// readable by this user only. It holds replayed conversation bodies and
+/// can be kept, so it is created 0700 on Unix, never readable by others even
+/// briefly, and checked after. Everything inside is reached through it.
+/// Elsewhere it is refused (fail closed): setting and checking a Windows ACL
+/// is not implemented.
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new().mode(0o700).create(dir)?;
+        let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            return Err(std::io::Error::other(format!(
+                "created with mode {mode:o}, not 700"
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Err(std::io::Error::other(
+            "an owner-only scratch is supported on Unix only; nothing was created",
+        ))
+    }
 }
 
 fn rebuild(store: &Store<'_>, scratch: &Path) -> Result<Report> {
@@ -147,6 +180,7 @@ fn rebuild(store: &Store<'_>, scratch: &Path) -> Result<Report> {
             }
             Replay::NoSource => report.not_replayable += 1,
             Replay::CutAfterRedaction => report.cut_after_redaction += 1,
+            Replay::Unsupported(why) => report.unsupported_span.push(format!("{}: {why}", m.id)),
         }
     }
     compare(&mut report, log.store(), &dialogs, &stored_hashes(store)?)?;
@@ -168,6 +202,8 @@ enum Replay {
     NoSource,
     /// See [`Report::cut_after_redaction`].
     CutAfterRedaction,
+    /// See [`Report::unsupported_span`].
+    Unsupported(String),
 }
 
 /// `m`'s body rebuilt from its archived span.
@@ -175,10 +211,12 @@ fn replay(store: &Store<'_>, m: &Memory, tools: &MessageTools) -> Result<Replay>
     if m.capture_id.is_none() {
         return Ok(Replay::NoSource);
     }
-    let Some(bytes) = crate::archive::span_bytes(store, &m.id)
+    let bytes = match crate::archive::span_bytes(store, &m.id)
         .map_err(|e| StoreError::Engine(format!("source of {}: {e}", m.id)))?
-    else {
-        return Ok(Replay::NoSource);
+    {
+        SpanRead::Bytes(bytes) => bytes,
+        SpanRead::Missing => return Ok(Replay::NoSource),
+        SpanRead::Unsupported(why) => return Ok(Replay::Unsupported(why)),
     };
     let continuation =
         m.metadata.get("type").and_then(serde_json::Value::as_str) == Some(CONTINUATION_TYPE);
@@ -272,4 +310,30 @@ fn orphans(dialogs: &[Memory], derived: &[Memory]) -> Vec<String> {
         })
         .map(|m| m.id.clone())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[cfg(not(unix))]
+    fn a_scratch_is_refused_where_it_cannot_be_owner_only() {
+        let dir = std::env::temp_dir().join(format!("rebuild_{}", uuid::Uuid::new_v4().simple()));
+        assert!(super::private_dir(&dir).is_err());
+        assert!(!dir.exists(), "nothing is created");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_scratch_is_created_owner_only_and_never_reused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rebuild_{}", uuid::Uuid::new_v4().simple()));
+        super::private_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        assert!(
+            super::private_dir(&dir).is_err(),
+            "an existing directory is refused"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
