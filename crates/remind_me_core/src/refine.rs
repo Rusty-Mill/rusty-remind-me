@@ -19,7 +19,6 @@
 //! starts the cooldown; #60 reads the same rows.
 
 use crate::db::curation::Curation;
-use crate::db::memories::{ListFilter, Memories};
 use crate::db::Store;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -213,42 +212,25 @@ fn observe(
     settings: &Settings,
     now: DateTime<Utc>,
 ) -> crate::db::Result<(Observed, Option<String>)> {
-    let curation = Curation::new(store);
     let settled_before = (now - Duration::minutes(i64::from(settings.idle_minutes))).to_rfc3339();
-    // One capture writes a dialog and a summary under one `capture_id` (and
-    // a continued transcript may add more), so count distinct captures, not
-    // rows: the threshold is in sessions. The count is a projection over ids
-    // and times, so a status read never loads transcript bodies.
-    let settled_backlog =
-        u64::try_from(curation.count_settled_captures(Some(&settled_before))?).unwrap_or(0);
-    let last_capture_at = curation
-        .capture_activity()?
-        .last_capture_at
-        .as_deref()
-        .and_then(parse_time);
-    let (last_run_id, last_run_at) = match last_run(store)? {
+    // One adapter call under one lock. One capture writes a dialog and a
+    // summary under one `capture_id` (and a continued transcript may add
+    // more), so the backlog counts distinct captures, not rows: the threshold
+    // is in sessions. SQLite reads ids and times only; the engine has no
+    // narrow read and clones each record once (see its implementation).
+    let seen = Curation::new(store).refine_observation(Some(&settled_before), RUN_CATEGORY)?;
+    let (last_run_id, last_run_at) = match seen.last_run {
         Some((id, at)) => (Some(id), parse_time(&at)),
         None => (None, None),
     };
     Ok((
         Observed {
-            settled_backlog,
-            last_capture_at,
+            settled_backlog: u64::try_from(seen.settled_captures).unwrap_or(0),
+            last_capture_at: seen.last_capture_at.as_deref().and_then(parse_time),
             last_run_at,
         },
         last_run_id,
     ))
-}
-
-/// The newest live run record's id and `created_at`.
-fn last_run(store: &Store<'_>) -> crate::db::Result<Option<(String, String)>> {
-    let filter = ListFilter {
-        include_sensitive: true,
-        category: Some(RUN_CATEGORY.to_string()),
-        ..ListFilter::default()
-    };
-    let (_, rows) = Memories::new(store).list_page(&filter, 1, 0)?;
-    Ok(rows.into_iter().next().map(|m| (m.id, m.created_at)))
 }
 
 fn parse_time(raw: &str) -> Option<DateTime<Utc>> {

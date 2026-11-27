@@ -6,6 +6,7 @@ use super::memories::{rows_where, text};
 use super::SqliteTables;
 use crate::db::curation::{
     Backlog, CaptureActivity, CaptureRow, CurationStore, ImportRow, NormalizationSource,
+    RefineObservation,
 };
 use crate::db::engine::curation::{
     capture_revisions, count_settled_captures, drawn_at, pairs_in, same_claim, same_project,
@@ -39,6 +40,31 @@ impl SqliteTables {
             || rows.iter().cloned(),
             settled_before,
         ))
+    }
+
+    /// The settled-capture count over only the columns the rule reads: no
+    /// content, tags or full rows.
+    fn count_settled_captures(&self, settled_before: Option<&str>) -> Result<i64> {
+        let facts: Vec<(String, String)> = self.all(
+            "SELECT source_capture_id, metadata, created_at FROM memories \
+             WHERE source_capture_id IS NOT NULL",
+            [],
+            |r| {
+                let (metadata, created_at): (String, String) = (r.get(1)?, r.get(2)?);
+                Ok((r.get(0)?, drawn_at(&metadata, &created_at)))
+            },
+        )?;
+        let captures: Vec<(String, String)> = self.all(
+            "SELECT capture_id, updated_at FROM memories WHERE capture_id IS NOT NULL \
+             AND source_capture_id IS NULL AND deleted_at IS NULL",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(count(count_settled_captures(
+            facts.into_iter(),
+            captures.into_iter(),
+            settled_before,
+        )))
     }
 
     fn unnormalized(&self, sources: &[&str]) -> Result<Vec<MemoryRow>> {
@@ -107,28 +133,22 @@ impl CurationStore for SqliteTables {
         ))
     }
 
-    fn count_settled_captures(&self, settled_before: Option<&str>) -> Result<i64> {
-        // Only the columns the rule reads: no content, tags or full rows.
-        let facts: Vec<(String, String)> = self.all(
-            "SELECT source_capture_id, metadata, created_at FROM memories \
-             WHERE source_capture_id IS NOT NULL",
-            [],
-            |r| {
-                let (metadata, created_at): (String, String) = (r.get(1)?, r.get(2)?);
-                Ok((r.get(0)?, drawn_at(&metadata, &created_at)))
-            },
-        )?;
-        let captures: Vec<(String, String)> = self.all(
-            "SELECT capture_id, updated_at FROM memories WHERE capture_id IS NOT NULL \
-             AND source_capture_id IS NULL AND deleted_at IS NULL",
-            [],
+    fn refine_observation(
+        &self,
+        settled_before: Option<&str>,
+        run_category: &str,
+    ) -> Result<RefineObservation> {
+        let last_run = self.one(
+            "SELECT id, created_at FROM memories WHERE deleted_at IS NULL AND category = ?1 \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            [run_category],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        Ok(count(count_settled_captures(
-            facts.into_iter(),
-            captures.into_iter(),
-            settled_before,
-        )))
+        Ok(RefineObservation {
+            settled_captures: self.count_settled_captures(settled_before)?,
+            last_capture_at: CurationStore::capture_activity(self)?.last_capture_at,
+            last_run,
+        })
     }
 
     fn capture_activity(&self) -> Result<CaptureActivity> {
@@ -325,7 +345,9 @@ mod tests {
 
         assert!(CurationStore::undecomposed(&tables, 10, None).is_err());
         assert_eq!(
-            CurationStore::count_settled_captures(&tables, None).unwrap(),
+            CurationStore::refine_observation(&tables, None, "refinement_run")
+                .unwrap()
+                .settled_captures,
             2
         );
     }

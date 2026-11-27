@@ -10,13 +10,13 @@ Dated entries, newest first. One entry per merged pull request.
 - The run record: a `refinement_run` memory whose `metadata.run` holds `decomposed`, `created`, `superseded` and `promoted` id arrays and `started_at`/`finished_at`. Add refuses a record without the object or the two times, or with a non-array id list, naming the key. The newest record starts the cooldown.
 - `docs/routines/session-ladder.md`: started by a person when a run is due, its queue window now matches the idle window (60 minutes, was 120), and a new step writes the record.
 
-- `CurationStore::count_settled_captures`: the distinct settled-capture count the flag uses, with no sorting, revisions or `CaptureRow`s on either backend. SQLite selects ids and times only. The engine store has no narrow read, so it still clones each record once before dropping the body; SQLite is the chosen backend (R4), so that gap is left documented.
+- `CurationStore::refine_observation`: what the flag reads (settled-capture count, last capture time, newest run record by `(created_at, id)`) in one call under one lock, with no sorting, revisions or `CaptureRow`s. SQLite selects ids and times only. The engine store has no narrow read, so it makes one pass that still clones each record once before dropping the body; SQLite is the chosen backend (R4), so that gap is left documented.
 
 ### Not changed
 - Nothing starts a run: no background model call, and the daily routine stays paused (D104, D16's reason).
 
 ### Tests
-- Below the backlog threshold, inside the cooldown, recent activity cancelling, due after a quiet hour, settings from the environment and a named typo, the nudge line, run record validation, and against a store: empty, due with 50 settled captures, cooldown after a record, `server_status` carrying `refine`; on both backends, the settled-capture count equals the distinct capture ids `undecomposed` lists, across duplicates, unsettled, decomposed, recaptured, deleted and 1 MB captures; on SQLite the count still answers when `content` and `tags` cannot be decoded, which the full listing cannot.
+- Below the backlog threshold, inside the cooldown, recent activity cancelling, due after a quiet hour, settings from the environment and a named typo, the nudge line, run record validation, and against a store: empty, due with 50 settled captures, cooldown after a record, `server_status` carrying `refine`; on both backends, the settled-capture count equals the distinct capture ids `undecomposed` lists, across duplicates, unsettled, decomposed, recaptured, deleted and 1 MB captures; the one-call observation's newest run and last capture match a category-filtered `list_page` and `capture_activity` (same-instant ids, sensitive, deleted and non-run rows); on SQLite the count still answers when `content` and `tags` cannot be decoded, which the full listing cannot.
 
 ## 2026-11-27 — Pinnable persona card (Mill Board #1555, D101, D102)
 
