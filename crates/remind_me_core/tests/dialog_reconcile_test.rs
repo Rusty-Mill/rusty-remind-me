@@ -159,6 +159,24 @@ fn only_the_full_check_sees_a_same_size_corruption() {
 }
 
 #[test]
+fn the_full_check_also_checks_the_recorded_size() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, db) = fresh("size");
+    let id = shadowed(&db, "alpha");
+    let mut store = SqliteDialogs::open(&store_dir(&dir)).unwrap();
+    // A row whose blob is intact but whose recorded size is not.
+    let mut wrong = store.get(&id).unwrap().unwrap();
+    wrong.id = "mem_wrong_size".into();
+    wrong.body_bytes += 1;
+    store.append(&wrong).unwrap();
+    for depth in [Depth::Quick, Depth::Full] {
+        let report = check(&db.store(), depth).unwrap().unwrap();
+        assert_eq!(report.blob_mismatch, ["mem_wrong_size"], "{depth:?}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn the_check_changes_nothing() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (dir, db) = fresh("readonly");

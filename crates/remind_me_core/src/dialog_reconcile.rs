@@ -19,7 +19,7 @@ use crate::db::dialogs::{dir_beside, DialogRecord, DialogStore};
 use crate::db::memories::Memories;
 use crate::db::sqlite::{SqliteDialogs, DIALOGS_FILE};
 use crate::db::{Result, Store, StoreError};
-use crate::models::Memory;
+use crate::models::{Memory, DIALOG_CATEGORY};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -110,7 +110,13 @@ fn blob_state(blobs: &BlobStore, r: &DialogRecord, depth: Depth) -> Result<Blob>
             Err(e) => Err(io(e)),
         },
         Depth::Full => match blobs.get(&r.body_hash).map_err(io)? {
-            Some(bytes) if content_key(&bytes) == r.body_hash => Ok(Blob::Intact),
+            // The size too: the canonical hash leaves it out, so nothing
+            // else would catch a wrong recorded size.
+            Some(bytes)
+                if bytes.len() as u64 == r.body_bytes && content_key(&bytes) == r.body_hash =>
+            {
+                Ok(Blob::Intact)
+            }
             Some(_) => Ok(Blob::Mismatch),
             None => Ok(Blob::Missing),
         },
@@ -129,20 +135,45 @@ pub fn check(store: &Store<'_>, depth: Depth) -> Result<Option<Report>> {
     };
     let dialogs = SqliteDialogs::open_read_only(&file)?;
     let blobs = BlobStore::new(file.with_file_name("blobs"));
-    let mut live: HashMap<String, Memory> = Memories::new(store)
-        .exportable(false, Some("dialog"), &[])?
+    let memories = Memories::new(store);
+    let live: HashMap<String, Memory> = memories
+        .exportable(false, Some(DIALOG_CATEGORY), &[])?
         .into_iter()
         .map(|m| (m.id.clone(), m))
         .collect();
+    let report = reconcile(&memories, &dialogs, &blobs, depth, live)?;
+    RUNS.fetch_add(1, Ordering::Relaxed);
+    LAST_FINDINGS.store(report.findings() as u64, Ordering::Relaxed);
+    Ok(Some(report))
+}
+
+/// Scan `dialogs` against `live`, the `memories` dialog rows read before
+/// the scan.
+fn reconcile(
+    memories: &Memories<'_>,
+    dialogs: &SqliteDialogs,
+    blobs: &BlobStore,
+    depth: Depth,
+    mut live: HashMap<String, Memory>,
+) -> Result<Report> {
     let mut report = Report::default();
     dialogs.scan(&mut |r| {
         report.rows += 1;
-        match blob_state(&blobs, &r, depth)? {
+        match blob_state(blobs, &r, depth)? {
             Blob::Missing => report.blob_missing.push(r.id.clone()),
             Blob::Mismatch => report.blob_mismatch.push(r.id.clone()),
             Blob::Intact => {}
         }
-        match live.remove(&r.id) {
+        // A capture may commit between the `memories` read and the scan,
+        // so an id missing from the read is looked up again before it is a
+        // finding.
+        let found = match live.remove(&r.id) {
+            Some(m) => Some(m),
+            None => memories
+                .get_live(&r.id)?
+                .filter(|m| m.category == DIALOG_CATEGORY),
+        };
+        match found {
             None => report.no_memory.push(r.id),
             Some(m) if as_record(&m).canonical_hash() != r.canonical_hash() => {
                 report.drift.push(r.id);
@@ -152,9 +183,7 @@ pub fn check(store: &Store<'_>, depth: Depth) -> Result<Option<Report>> {
         Ok(())
     })?;
     report.not_migrated = live.len() as u64;
-    RUNS.fetch_add(1, Ordering::Relaxed);
-    LAST_FINDINGS.store(report.findings() as u64, Ordering::Relaxed);
-    Ok(Some(report))
+    Ok(report)
 }
 
 /// One log line for `report`.
@@ -198,5 +227,56 @@ pub fn start_for(store: &Store<'_>) -> Option<std::thread::JoinHandle<()>> {
             eprintln!("rusty-remind-me: dialog store check not started: {e}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::dialogs::{DialogLog, NewDialog};
+
+    #[test]
+    fn a_row_committed_after_the_memories_read_is_not_an_orphan() {
+        let dir = std::env::temp_dir().join(format!("reconcile_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::Database::open(dir.join("remind_me.db")).unwrap();
+        let input = crate::AutoCaptureInput {
+            conversation: "user: hi\nassistant: hello".into(),
+            summary: "A greeting.".into(),
+            title: String::new(),
+            tags: vec![],
+            category: "conversation".into(),
+            metadata: serde_json::json!({}),
+            project: None,
+        };
+        let made = crate::capture::auto_capture(&db.store(), &input).unwrap();
+        let row = Memories::new(&db.store())
+            .get_live(&made.dialog_id)
+            .unwrap()
+            .unwrap();
+        let store_dir = dir.join("dialogs");
+        let blobs = BlobStore::new(store_dir.join("blobs"));
+        let mut log = DialogLog::new(SqliteDialogs::open(&store_dir).unwrap(), blobs.clone());
+        log.record(&NewDialog {
+            id: &row.id,
+            capture_id: &made.capture_id,
+            session_id: row.session_id.as_deref(),
+            project: row.project.as_deref(),
+            created_at: &row.created_at,
+            body: &row.content,
+        })
+        .unwrap();
+
+        // An empty read stands for one taken before the capture committed.
+        let report = reconcile(
+            &Memories::new(&db.store()),
+            log.store(),
+            &blobs,
+            Depth::Quick,
+            HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(report.findings(), 0, "{report:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
