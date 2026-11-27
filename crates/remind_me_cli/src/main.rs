@@ -1759,10 +1759,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         std::process::exit(1);
                     }
                 };
+                // Read only: only an already-running daemon. Starting one, or
+                // opening the store here, runs open-time housekeeping that
+                // writes.
+                let mut store = daemon::existing_daemon(&db_path)?;
                 let findings = match verb {
                     DialogsVerb::Check { full } => {
                         let report: Option<DialogReport> =
-                            Store::open(&db_path)?.call(Op::DialogsCheck { full })?;
+                            daemon_plan(&mut store, Op::DialogsCheck { full })?;
                         let Some(report) = report else {
                             println!("no dialog store beside {}", db_path.display());
                             return Ok(());
@@ -1773,8 +1777,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     DialogsVerb::RebuildCheck { scratch, keep } => {
                         // The daemon may run elsewhere: give it an absolute path.
                         let scratch = scratch.map(std::path::absolute).transpose()?;
-                        let report: RebuildReport = Store::open(&db_path)?
-                            .call(Op::DialogsRebuildCheck { scratch, keep })?;
+                        let report: RebuildReport =
+                            daemon_plan(&mut store, Op::DialogsRebuildCheck { scratch, keep })?;
                         println!("{}", serde_json::to_string_pretty(&report)?);
                         report.findings()
                     }

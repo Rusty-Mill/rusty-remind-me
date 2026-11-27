@@ -157,6 +157,25 @@ fn a_truncated_transcript_replays_with_its_cut() {
 }
 
 #[test]
+fn a_cut_row_whose_source_was_redacted_is_counted_not_replayed() {
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, db) = fresh("cut_redacted");
+    // The card falls in the kept tail; its replacement has another length,
+    // so the archive (redacted before the cut) would cut elsewhere.
+    let long = format!("{} card {CARD}", "y".repeat(MAX_DIALOG_CHARS + 50));
+    capture(
+        &db,
+        &[text(1, "user", "start"), text(2, "assistant", &long)],
+    );
+
+    let report = check(&db.store(), Some(&dir.join("scratch")), false).unwrap();
+
+    assert_eq!(report.findings(), 0, "{report:?}");
+    assert_eq!((report.replayed, report.cut_after_redaction), (0, 1));
+    done(&dir);
+}
+
+#[test]
 fn a_changed_message_tools_setting_is_a_mismatch_and_named() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (dir, db) = fresh("tools");

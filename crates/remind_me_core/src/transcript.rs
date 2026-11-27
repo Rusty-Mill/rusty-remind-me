@@ -448,7 +448,11 @@ fn render_dialog(messages: &[ChatMessage], message_tools: &MessageTools) -> Stri
 /// (#528, D133): a first row as a first capture renders it (cut to
 /// [`MAX_DIALOG_CHARS`]), a continuation as a recapture does (uncut), both
 /// scrubbed as they were when written.
-pub(crate) fn replay_row(span: &str, continuation: bool, tools: &MessageTools) -> String {
+///
+/// `None` for a first row that is cut when its source holds a redaction: the
+/// capture cut the raw text and then redacted it, but the archive was
+/// redacted first, so a replacement of another length moves the cut.
+pub(crate) fn replay_row(span: &str, continuation: bool, tools: &MessageTools) -> Option<String> {
     let messages = messages_of(span);
     let text = if continuation {
         messages
@@ -459,8 +463,11 @@ pub(crate) fn replay_row(span: &str, continuation: bool, tools: &MessageTools) -
     } else {
         render_dialog(&messages, tools)
     };
+    if text.starts_with(TRUNCATION_MARKER) && span.contains(crate::redact::REDACTED_PREFIX) {
+        return None;
+    }
     let (mut tags, mut metadata) = (Vec::new(), serde_json::json!({}));
-    crate::boundary::scrub(&text, &mut tags, &mut metadata)
+    Some(crate::boundary::scrub(&text, &mut tags, &mut metadata))
 }
 
 impl TranscriptSummary {

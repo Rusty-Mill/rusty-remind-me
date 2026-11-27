@@ -47,6 +47,9 @@ pub struct Report {
     pub replayed: u64,
     /// Rows with no archived source span.
     pub not_replayable: u64,
+    /// First rows cut to `MAX_DIALOG_CHARS` whose source holds a
+    /// redaction: the cut cannot be placed again, so they are not replayed.
+    pub cut_after_redaction: u64,
     /// Replayed rows the dialog store does not hold.
     pub not_in_store: u64,
     /// Bodies that a scrub would still change.
@@ -138,11 +141,12 @@ fn rebuild(store: &Store<'_>, scratch: &Path) -> Result<Report> {
             report.unstable_redaction.push(m.id.clone());
         }
         match replay(store, m, &tools)? {
-            Some(body) => {
+            Replay::Body(body) => {
                 report.replayed += 1;
                 log.record(&replayed_row(m, &body))?;
             }
-            None => report.not_replayable += 1,
+            Replay::NoSource => report.not_replayable += 1,
+            Replay::CutAfterRedaction => report.cut_after_redaction += 1,
         }
     }
     compare(&mut report, log.store(), &dialogs, &stored_hashes(store)?)?;
@@ -157,25 +161,30 @@ fn redaction_stable(body: &str) -> bool {
     crate::boundary::scrub(body, &mut tags, &mut metadata) == body
 }
 
-/// `m`'s body rebuilt from its archived span; `None` with no span or no
-/// capture id.
-fn replay(store: &Store<'_>, m: &Memory, tools: &MessageTools) -> Result<Option<String>> {
+/// What replaying one row gave.
+enum Replay {
+    Body(String),
+    /// No archived span, or no capture id.
+    NoSource,
+    /// See [`Report::cut_after_redaction`].
+    CutAfterRedaction,
+}
+
+/// `m`'s body rebuilt from its archived span.
+fn replay(store: &Store<'_>, m: &Memory, tools: &MessageTools) -> Result<Replay> {
     if m.capture_id.is_none() {
-        return Ok(None);
+        return Ok(Replay::NoSource);
     }
     let Some(bytes) = crate::archive::span_bytes(store, &m.id)
         .map_err(|e| StoreError::Engine(format!("source of {}: {e}", m.id)))?
     else {
-        return Ok(None);
+        return Ok(Replay::NoSource);
     };
     let continuation =
         m.metadata.get("type").and_then(serde_json::Value::as_str) == Some(CONTINUATION_TYPE);
     let span = String::from_utf8_lossy(&bytes);
-    Ok(Some(crate::transcript::replay_row(
-        &span,
-        continuation,
-        tools,
-    )))
+    Ok(crate::transcript::replay_row(&span, continuation, tools)
+        .map_or(Replay::CutAfterRedaction, Replay::Body))
 }
 
 /// The scratch row for `m`: its own fields, the replayed body.

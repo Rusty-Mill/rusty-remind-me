@@ -235,7 +235,7 @@ fn existing_daemon_with(
 ) -> Result<DaemonConnection> {
     let refuse = |why: &str| -> Box<dyn Error> {
         format!(
-            "decisions dry runs need the remind-me daemon already running ({why}); \
+            "this read-only command needs the remind-me daemon already running ({why}); \
              start it with `rusty-remind-me daemon` and retry. Nothing was read or written."
         )
         .into()

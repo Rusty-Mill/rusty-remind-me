@@ -46,7 +46,7 @@ fn snapshot(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
 }
 
 #[test]
-fn with_no_daemon_both_dry_runs_fail_closed_and_touch_nothing() {
+fn with_no_daemon_read_only_commands_fail_closed_and_touch_nothing() {
     let store_dir = scratch("store");
     let db = store_dir.join("remind_me.db");
     let made = cli(&db, &["add", "D1: keep one store"], Some("0"));
@@ -61,7 +61,9 @@ fn with_no_daemon_both_dry_runs_fail_closed_and_touch_nothing() {
     let log_arg = log.to_string_lossy().to_string();
     let before = snapshot(&store_dir);
 
-    let runs: [(&[&str], Option<&str>); 4] = [
+    let runs: [(&[&str], Option<&str>); 6] = [
+        (&["dialogs", "check"], None),
+        (&["dialogs", "rebuild-check"], Some("0")),
         (&["decisions", "normalize"], None),
         (
             &["decisions", "import", &log_arg, "--project", "mill"],
@@ -78,7 +80,7 @@ fn with_no_daemon_both_dry_runs_fail_closed_and_touch_nothing() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{args:?} must fail with no daemon");
         assert!(
-            stderr.contains("need the remind-me daemon already running")
+            stderr.contains("needs the remind-me daemon already running")
                 && stderr.contains("Nothing was read or written."),
             "{args:?}: {stderr}"
         );
