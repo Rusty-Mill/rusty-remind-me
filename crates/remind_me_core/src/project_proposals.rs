@@ -316,13 +316,14 @@ pub fn reject(store: &Store<'_>, key: &str, rejected_by: &str) -> Result<String>
         &mut tags,
         &mut metadata,
     );
+    let provenance = crate::context::default_provenance();
     let row = NewMemory {
         category: crate::kinds::MemoryKind::WorkLog.as_str().to_string(),
         memory_type: crate::kinds::MemoryKind::WorkLog.as_str().to_string(),
         tags,
         source: SOURCE.to_string(),
-        metadata,
-        ..crate::context::default_provenance().stamp(NewMemory::new(
+        metadata: provenance.metadata(metadata),
+        ..provenance.stamp(NewMemory::new(
             format!("mem_{}", uuid::Uuid::new_v4().simple()),
             content,
             &now,

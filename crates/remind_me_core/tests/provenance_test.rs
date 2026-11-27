@@ -470,3 +470,69 @@ fn with_a_registry_the_env_beats_the_handshake_and_strangers_are_unknown() {
     assert_eq!((status.registry.as_str(), status.registered), ("ready", 1));
     assert_eq!(status.unknown_writes, before + 1);
 }
+
+/// `metadata` as a JSON value, whichever way the backend returns it.
+fn metadata_of(store: &Store<'_>, id: &str) -> serde_json::Value {
+    match remind_me_core::testing::memory_column(store, id, "metadata").unwrap() {
+        Some(serde_json::Value::String(raw)) => serde_json::from_str(&raw).unwrap(),
+        Some(other) => other,
+        None => serde_json::Value::Null,
+    }
+}
+
+#[test]
+fn every_stamped_write_path_keeps_the_handshake_app() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ident = Ident::set();
+    let db = db("client_app_paths");
+    let store = db.store();
+    let now = chrono::Utc::now().to_rfc3339();
+    // Written directly, so it carries no app: the one row not checked.
+    remind_me_core::db::memories::Memories::new(&store)
+        .insert(&remind_me_core::db::memories::NewMemory {
+            category: "scenario".to_string(),
+            ..remind_me_core::db::memories::NewMemory::new("mem_src", "scenario source", &now)
+        })
+        .unwrap();
+    set_handshake_client(Some("hermes/0.9".to_string()));
+
+    remind_me_core::promotion::promote(
+        &store,
+        &serde_json::from_value(serde_json::json!({
+            "rung": "scenario_to_persona",
+            "source_ids": ["mem_src"],
+            "content": "Ships small reversible changes.",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let capture = remind_me_core::capture::auto_capture(
+        &store,
+        &serde_json::from_value(serde_json::json!({
+            "conversation": "user: one\nassistant: two\nuser: three",
+            "summary": "a short exchange",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    remind_me_core::skeleton::write_skeleton(
+        &store,
+        &serde_json::from_value(serde_json::json!({
+            "capture_id": capture.capture_id,
+            "mermaid": "graph TD\n  n1[opening]",
+            "nodes": { "n1": [1, 2] },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let ids = remind_me_core::testing::memory_ids(&store).unwrap();
+    assert_eq!(
+        ids.len(),
+        5,
+        "source, promoted, two capture halves, skeleton"
+    );
+    for id in ids.iter().filter(|id| id.as_str() != "mem_src") {
+        assert_eq!(metadata_of(&store, id)["client_app"], "hermes/0.9", "{id}");
+    }
+}
