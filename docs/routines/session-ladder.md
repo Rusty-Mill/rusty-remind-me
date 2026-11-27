@@ -1,6 +1,11 @@
 # Routine: refine settled sessions (ADR-0029)
 
-A scheduled Claude routine runs this once a day. It needs the remind-me connector with the
+A person starts this routine when remind-me says a run is due (Mill Board #1554, D104): the
+maintenance nudge shows "refinement due", and `remind_me_server_status` reports `refine.state: "due"`.
+A run is due when at least `REMIND_ME_REFINE_MIN_BACKLOG` (50) settled captures wait,
+`REMIND_ME_REFINE_COOLDOWN_HOURS` (8) have passed since the last run record, and nothing was captured
+for `REMIND_ME_REFINE_IDLE_MINUTES` (60). The server never starts it, and the old daily schedule stays
+paused (2026-11-09). It needs the remind-me connector with the
 `full` or `standard` tool profile, or any profile with the `pipeline` group (ADR-0030). It touches nothing outside remind-me.
 
 ## Prompt
@@ -31,5 +36,11 @@ You are refining captured Claude Code sessions in remind-me. Use only the remind
 4. Call `remind_me_queue` with `kind: "promotion", rung: "fact_to_scenario"`. For each candidate,
    write a short topic summary that the facts support, and call `remind_me_promote` with
    `rung: "fact_to_scenario"` and all of its `source_ids`. Don't promote to persona.
-5. Finish with one line: how many sessions were decomposed, how many facts were written and how
+5. Record the run: call `remind_me_add` once with `category: "refinement_run"`,
+   `memory_type: "reference"`, `tags: ["refinement"]`, content "Refinement run: N sessions, F facts,
+   S scenarios", and `metadata.run` = `{"decomposed": [capture ids], "created": [fact ids],
+   "superseded": [ids any decompose or promote reported superseding], "promoted": [scenario ids],
+   "started_at": <RFC 3339>, "finished_at": <RFC 3339>}`. This starts the cooldown; skip it and the
+   next check reports the run as due again.
+6. Finish with one line: how many sessions were decomposed, how many facts were written and how
    many scenarios were promoted.

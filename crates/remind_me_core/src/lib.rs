@@ -68,6 +68,7 @@ pub mod rate_limit;
 pub mod readwise_import;
 pub mod recalibrate;
 pub mod redact;
+pub mod refine;
 pub mod reminders;
 pub mod remote;
 pub mod reranker;

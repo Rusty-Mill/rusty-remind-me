@@ -160,6 +160,9 @@ impl PreparedAdd {
             outcome: fields.outcome.clone(),
             ..provenance.stamp(NewMemory::new(id.clone(), content.clone(), &now_iso))
         };
+        if row.category == crate::refine::RUN_CATEGORY {
+            crate::refine::validate_run(&row.metadata)?;
+        }
         Ok(Self {
             id,
             content,
