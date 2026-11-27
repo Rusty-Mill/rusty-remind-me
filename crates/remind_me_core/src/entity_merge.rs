@@ -526,12 +526,16 @@ fn refuse_out_of_order(store: &Store<'_>, row: &Memory, record: &Record) -> Resu
         .flat_map(|r| [r.subject_entity_id.as_str(), r.object_entity_id.as_str()])
         .filter(|end| *end != record.from.id)
         .collect();
+    // A later merge into or out of A or any relation end may have counted a
+    // row this merge wrote as shared; undoing this one first would lose it.
+    let mut touched = ends.clone();
+    touched.insert(record.into_id.as_str());
     for later in live_records(store)? {
         if later.id == row.id || later.created_at < row.created_at {
             continue;
         }
         let other = record_of(&later)?;
-        if other.into_id == record.into_id || ends.contains(other.from.id.as_str()) {
+        if touched.contains(other.into_id.as_str()) || touched.contains(other.from.id.as_str()) {
             return Err(StoreError::Invalid(format!(
                 "merge {} came after {} and touches the same entities; revert it first",
                 later.id, row.id

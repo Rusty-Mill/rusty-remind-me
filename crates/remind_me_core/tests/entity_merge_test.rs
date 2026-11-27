@@ -430,6 +430,35 @@ fn a_revert_waits_when_a_relation_end_was_merged_since() {
 }
 
 #[test]
+fn a_revert_waits_when_a_later_merge_into_a_relation_end_shared_its_row() {
+    // B -> C and X -> A share a label. Merging B into A writes A -> C; merging
+    // X into C then drops its A -> C as shared. Undoing the first merge before
+    // the second would delete the row X contributed.
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let p = pair(&store);
+    let c = entity(&store, "rusty_term", None, &[]);
+    let x = entity(&store, "rusty_conhost", None, &[]);
+    upsert_entity_relation(&store, &p.b.id, "uses", &c.id).unwrap();
+    upsert_entity_relation(&store, &p.a.id, "uses", &x.id).unwrap();
+    let (_, first) = merged(entity_merge::merge(&store, "rusty-mux", "rusty_mux").unwrap());
+    let (_, second) = merged(entity_merge::merge(&store, "rusty_conhost", "rusty_term").unwrap());
+
+    let err = entity_merge::revert(&store, &first, "rusty-mux").unwrap_err();
+    assert!(err.to_string().contains("revert it first"), "{err}");
+
+    entity_merge::revert(&store, &second, "rusty_conhost").unwrap();
+    entity_merge::revert(&store, &first, "rusty-mux").unwrap();
+    let rows = relations(&store);
+    assert!(rows
+        .iter()
+        .any(|r| r.subject_entity_id == p.b.id && r.object_entity_id == c.id));
+    assert!(rows
+        .iter()
+        .any(|r| r.subject_entity_id == p.a.id && r.object_entity_id == x.id));
+}
+
+#[test]
 fn a_triple_a_has_under_an_older_id_still_blocks_the_moved_row() {
     use remind_me_core::db::derived::Origin;
     use remind_me_core::db::entities::RelationRow;
