@@ -396,7 +396,7 @@ fn write_update(
     if let Some(supplied) = &client_metadata {
         crate::kinds::validate_occurred_at(supplied)?;
     }
-    check_persona_edit(&stored, input.category.as_deref(), metadata)?;
+    check_persona_edit(stored, input.category.as_deref(), metadata)?;
     // Becoming a decision schedules its follow-up; staying one does not.
     let scheduled = if stored.memory_type.as_deref() == Some("decision") {
         None
