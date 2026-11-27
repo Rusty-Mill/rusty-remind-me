@@ -2,7 +2,7 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
-## 2026-11-27 — Hermes memory provider; `capture-transcript --format messages` (Mill Board #1552 PR C, ADR-0028 step 6, D105, D115)
+## 2026-11-27 — Hermes memory provider; `capture-transcript --format messages` (Mill Board #1552 PR C, ADR-0028 step 6, D105, D131)
 
 ### Added
 - `plugins/hermes-memory/`: remind-me as a Hermes memory provider (`memory.provider: remind-me`). Each profile writes as `hermes-<profile>`. It opens the system prompt with `remind_me_brief` for the configured project, searches each turn's text before the model answers, proxies the tools remind-me lists for the client, and captures the transcript once at session end (not for cron jobs or subagents). Local mode runs `rusty-remind-me server` over stdio; remote mode uses the connector URL and `REMIND_ME_TOKEN`. Standard library only.
@@ -15,7 +15,7 @@ Dated entries, newest first. One entry per merged pull request.
 - Rust: a messages capture stores hook/auto rows, a second capture replaces in place with the same id, bad lists store nothing; the CLI reads and checks stdin first.
 - Python, run by hand (`python3 -m unittest discover -s plugins/hermes-memory/tests -v`; not in CI, per the #1552 design): settings, client id, MCP over a fake server (JSON and SSE replies), stdio and local capture through a fake executable, every provider method, and failure as empty recall. With `REMIND_ME_TEST_BINARY` set, a round trip against the real server on a throwaway store.
 
-## 2026-11-27 — Per-client tool profile, format and brief budget; the `minimal` profile (Mill Board #1552 PR B, ADR-0028 step 3, D110-D115)
+## 2026-11-27 — Per-client tool profile, format and brief budget; the `minimal` profile (Mill Board #1552 PR B, ADR-0028 step 3, D126-D131)
 
 ### Added
 - `minimal` tool profile: search, get, add, auto_capture and brief only, for small local models. Before this, `minimal` was unrecognised and fell back to `full`. `minimal,<group>` adds a group; any part that turns on core (`core`, `standard`, `full`) wins. An alias works exactly when the tool it merged into is listed. A preset, not a group (ADR-0030 amended).
@@ -26,7 +26,7 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Unchanged
 - With no registry, or a client it does not list, profile and format resolve as before. No tool is renamed or removed; no schema change.
-- Not yet: the ADR-0028 §3 CI test over descriptions and schemas (with #52/#54, D114).
+- Not yet: the ADR-0028 §3 CI test over descriptions and schemas (with #52/#54, D130).
 
 ### Tests
 - `minimal` lists exactly five tools and refuses core ones with the remedy; `minimal,wiki`, `minimal,core`, `minimal,standard`; a registered profile beats the env and its refusal names the registry; an unlisted client keeps the env profile; a registered format becomes search's default and an explicit one wins; a registered brief budget is the default and an explicit one wins; registry field validation.

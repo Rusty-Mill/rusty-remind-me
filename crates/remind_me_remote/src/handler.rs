@@ -118,7 +118,7 @@ impl ToolSource for Tools {
     }
 
     /// Listed per caller, like a call: the caller's registered profile
-    /// decides what it sees (ADR-0028 §2, D113), so the list matches what a
+    /// decides what it sees (ADR-0028 §2, D129), so the list matches what a
     /// call would be allowed.
     fn tools_for(&self, ctx: &CallContext) -> Result<Vec<Tool>, ErrorData> {
         let params = json!({ "_meta": { CALLER_META_KEY: caller_of(ctx) } });
