@@ -21,6 +21,7 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::clients::CLIENTS_FILE_ENV;
 use remind_me_core::db::Store;
 use remind_me_core::sync::{
     configured_client, memory_provenance, set_handshake_client, with_call_client, CLIENT_ENV,
@@ -43,6 +44,7 @@ impl Ident {
     fn set() -> Self {
         crate::test_env::set_var(NODE_ID_ENV, TEST_NODE);
         crate::test_env::set_var(CLIENT_ENV, TEST_CLIENT);
+        no_registry();
         set_handshake_client(None);
         Ident
     }
@@ -51,8 +53,23 @@ impl Drop for Ident {
     fn drop(&mut self) {
         crate::test_env::remove_var(NODE_ID_ENV);
         crate::test_env::remove_var(CLIENT_ENV);
+        no_registry();
         set_handshake_client(None);
     }
+}
+
+/// Point the client registry at a file that does not exist, so a real
+/// `~/.remind-me/clients.json` cannot change what these tests see.
+fn no_registry() {
+    let missing = std::env::temp_dir().join(format!("rrm_no_clients_{}.json", std::process::id()));
+    crate::test_env::set_var(CLIENTS_FILE_ENV, missing);
+}
+
+/// Write `json` as this test's client registry.
+fn registry(name: &str, json: &str) {
+    let file = std::env::temp_dir().join(format!("rrm_clients_{name}_{}.json", std::process::id()));
+    std::fs::write(&file, json).unwrap();
+    crate::test_env::set_var(CLIENTS_FILE_ENV, file);
 }
 
 fn db(name: &str) -> Database {
@@ -304,6 +321,7 @@ fn with_nothing_configured_the_client_is_unknown_and_the_node_is_empty() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     crate::test_env::remove_var(NODE_ID_ENV);
     crate::test_env::remove_var(CLIENT_ENV);
+    no_registry();
     set_handshake_client(None);
 
     // The default is still `unknown`; this change makes the column *consistent*,
@@ -393,4 +411,53 @@ fn a_continuation_row_is_stamped_and_keeps_its_session() {
     assert_eq!(continuation.project, dialog.project);
     assert_eq!(continuation.written_by, "hook");
     assert_eq!(continuation.capture_method, "auto");
+}
+
+#[test]
+fn a_registry_maps_the_handshake_alias_and_keeps_the_app_in_metadata() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ident = Ident::set();
+    crate::test_env::remove_var(CLIENT_ENV);
+    registry(
+        "alias",
+        r#"{ "claude-code": { "aliases": ["claude-code"] } }"#,
+    );
+    set_handshake_client(Some("claude-code/2.1.0".to_string()));
+    assert_eq!(configured_client(), "claude-code");
+
+    let db = db("registry_alias");
+    let store = db.store();
+    let added = queries::add_memory(
+        &store,
+        serde_json::from_value(serde_json::json!({ "content": "a wombat fact" })).unwrap(),
+    )
+    .unwrap();
+    let id = added.id;
+    let client = remind_me_core::testing::memory_text(&store, &id, "client").unwrap();
+    assert_eq!(client.as_deref(), Some("claude-code"));
+    let metadata = remind_me_core::testing::memory_column(&store, &id, "metadata")
+        .unwrap()
+        .unwrap();
+    let metadata: serde_json::Value = match metadata {
+        serde_json::Value::String(raw) => serde_json::from_str(&raw).unwrap(),
+        other => other,
+    };
+    assert_eq!(metadata["client_app"], "claude-code/2.1.0");
+}
+
+#[test]
+fn with_a_registry_the_env_beats_the_handshake_and_strangers_are_unknown() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ident = Ident::set();
+    registry("order", r#"{ "hermes-jarvis": {} }"#);
+    crate::test_env::set_var(CLIENT_ENV, "hermes-jarvis");
+    set_handshake_client(Some("mcp-python-sdk/1.2".to_string()));
+    assert_eq!(configured_client(), "hermes-jarvis");
+
+    crate::test_env::remove_var(CLIENT_ENV);
+    let before = remind_me_core::clients::status().unknown_writes;
+    assert_eq!(memory_provenance().1, DEFAULT_CLIENT);
+    let status = remind_me_core::clients::status();
+    assert_eq!((status.registry.as_str(), status.registered), ("ready", 1));
+    assert_eq!(status.unknown_writes, before + 1);
 }

@@ -138,7 +138,7 @@ impl PreparedAdd {
             category: input.category.clone(),
             tags: input.tags.clone(),
             source: input.source.clone(),
-            metadata: input.metadata.clone(),
+            metadata: provenance.metadata(input.metadata.clone()),
             subject: input.subject.clone(),
             predicate: input.predicate.clone(),
             object: input.object.clone(),
