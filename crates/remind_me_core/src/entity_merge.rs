@@ -176,20 +176,28 @@ enum Sides {
 /// B by its own name or id only (an alias would find A after a merge); A
 /// by name, id or alias. Refuses what may not be merged.
 fn sides(store: &Store<'_>, from: &str, into: &str) -> Result<Sides> {
-    let Some(b) = exact(store, from)? else {
-        return match live_record_for(store, from)? {
-            Some(record) => Ok(Sides::Merged {
-                record_id: record.id,
-                into: record.object.unwrap_or_default(),
-            }),
-            None => Err(StoreError::Invalid(format!("no entity named {from:?}"))),
-        };
-    };
     let a = match exact(store, into)? {
-        Some(a) => a,
-        None => resolve_entity(store, into)?
-            .ok_or_else(|| StoreError::Invalid(format!("no entity named {into:?}")))?,
+        Some(a) => Some(a),
+        None => resolve_entity(store, into)?,
     };
+    let Some(b) = exact(store, from)? else {
+        let Some(row) = live_record_for(store, from)? else {
+            return Err(StoreError::Invalid(format!("no entity named {from:?}")));
+        };
+        let record = record_of(&row)?;
+        let target = row.object.clone().unwrap_or_default();
+        if a.as_ref().is_some_and(|a| a.id != record.into_id) {
+            return Err(StoreError::Invalid(format!(
+                "{from:?} was already merged into {target:?} by {}",
+                row.id
+            )));
+        }
+        return Ok(Sides::Merged {
+            record_id: row.id,
+            into: target,
+        });
+    };
+    let a = a.ok_or_else(|| StoreError::Invalid(format!("no entity named {into:?}")))?;
     refuse(store, &b, &a)?;
     Ok(Sides::Pair(Box::new((b, a))))
 }
@@ -231,24 +239,43 @@ fn refuse(store: &Store<'_>, b: &Entity, a: &Entity) -> Result<()> {
     Ok(())
 }
 
-/// The newest live merge record whose absorbed name is `name`.
-fn live_record_for(store: &Store<'_>, name: &str) -> Result<Option<Memory>> {
-    let key = normalize_entity_name(name);
-    let found = Memories::new(store)
+/// Every live (unreverted) merge record.
+fn live_records(store: &Store<'_>) -> Result<Vec<Memory>> {
+    Ok(Memories::new(store)
         .with_predicate_prefix(MERGED_INTO)?
         .into_iter()
+        .filter(|m| m.predicate.as_deref() == Some(MERGED_INTO))
         .filter(|m| m.superseded_by.is_none())
-        .filter(|m| m.subject.as_deref().map(normalize_entity_name).as_deref() == Some(&key))
-        .max_by(|x, y| x.created_at.cmp(&y.created_at));
+        .collect())
+}
+
+/// The newest live merge record that absorbed `name_or_id`, by the absorbed
+/// entity's name or id.
+fn live_record_for(store: &Store<'_>, name_or_id: &str) -> Result<Option<Memory>> {
+    let key = normalize_entity_name(name_or_id);
+    let raw = name_or_id.trim();
+    let mut found: Option<Memory> = None;
+    for row in live_records(store)? {
+        let by_name = row.subject.as_deref().map(normalize_entity_name).as_deref() == Some(&key);
+        if !by_name && record_of(&row)?.from.id != raw {
+            continue;
+        }
+        if found.as_ref().is_none_or(|f| row.created_at > f.created_at) {
+            found = Some(row);
+        }
+    }
     Ok(found)
 }
 
-fn relations_of(store: &Store<'_>, id: &str) -> Result<Vec<StoredRelation>> {
-    Ok(Entities::new(store)
-        .relations_oldest_first()?
-        .into_iter()
-        .filter(|r| r.subject_entity_id == id || r.object_entity_id == id)
-        .collect())
+/// The undo data a merge record carries.
+fn record_of(row: &Memory) -> Result<Record> {
+    let value = row
+        .metadata
+        .get(META_KEY)
+        .cloned()
+        .ok_or_else(|| StoreError::Invalid(format!("{} has no {META_KEY} metadata", row.id)))?;
+    serde_json::from_value(value)
+        .map_err(|e| StoreError::Invalid(format!("{}: unreadable merge record: {e}", row.id)))
 }
 
 fn draft(store: &Store<'_>, b: &Entity, a: &Entity) -> Result<Draft> {
@@ -265,14 +292,27 @@ fn draft(store: &Store<'_>, b: &Entity, a: &Entity) -> Result<Draft> {
         })
         .collect();
 
-    let b_relations = relations_of(store, &b.id)?;
-    let a_relations = relations_of(store, &a.id)?;
-    let mut taken: HashSet<String> = a_relations.iter().map(|r| r.id.clone()).collect();
+    let all = entities.relations_oldest_first()?;
+    let touches =
+        |r: &StoredRelation, id: &str| r.subject_entity_id == id || r.object_entity_id == id;
+    let a_relations: Vec<&StoredRelation> = all.iter().filter(|r| touches(r, &a.id)).collect();
+    // A triple A already has, under any id (older stores keep pre-derivation
+    // ids), and any id in use, block a moved row.
+    let mut taken_triples: HashSet<(String, String, String)> = a_relations
+        .iter()
+        .map(|r| triple(&r.subject_entity_id, &r.relation, &r.object_entity_id))
+        .collect();
+    let mut taken_ids: HashSet<String> = all.iter().map(|r| r.id.clone()).collect();
+    let b_relations: Vec<StoredRelation> =
+        all.iter().filter(|r| touches(r, &b.id)).cloned().collect();
     let relations: Vec<RelationSnapshot> = b_relations
         .into_iter()
         .map(|r| {
-            let moved_to =
-                moved_relation_id(&r, &b.id, &a.id).filter(|id| taken.insert(id.clone()));
+            let subject = swap_end(&r.subject_entity_id, &b.id, &a.id);
+            let object = swap_end(&r.object_entity_id, &b.id, &a.id);
+            let moved_to = moved_relation_id(&r, &b.id, &a.id)
+                .filter(|_| taken_triples.insert(triple(subject, &r.relation, object)))
+                .filter(|id| taken_ids.insert(id.clone()));
             RelationSnapshot {
                 id: r.id,
                 subject_entity_id: r.subject_entity_id,
@@ -333,6 +373,15 @@ fn side(e: &Entity, links: usize, relations: usize) -> Side {
         links,
         relations,
     }
+}
+
+/// A relation as a comparable triple, its label normalised as ids are.
+fn triple(subject: &str, relation: &str, object: &str) -> (String, String, String) {
+    (
+        subject.to_string(),
+        normalize_entity_name(relation),
+        object.to_string(),
+    )
 }
 
 /// A relation end, with B replaced by A.
@@ -419,16 +468,7 @@ fn revert_in(store: &Store<'_>, record_id: &str, from: &str) -> Result<RevertOut
             revert_id,
         });
     }
-    let record: Record = row
-        .metadata
-        .get(META_KEY)
-        .cloned()
-        .ok_or_else(|| StoreError::Invalid(format!("{record_id} has no {META_KEY} metadata")))
-        .and_then(|v| {
-            serde_json::from_value(v).map_err(|e| {
-                StoreError::Invalid(format!("{record_id}: unreadable merge record: {e}"))
-            })
-        })?;
+    let record = record_of(&row)?;
     if normalize_entity_name(from) != normalize_entity_name(&record.from.name)
         && from.trim() != record.from.id
     {
@@ -447,6 +487,7 @@ fn revert_in(store: &Store<'_>, record_id: &str, from: &str) -> Result<RevertOut
     let a = entities.get(&record.into_id)?.ok_or_else(|| {
         StoreError::Invalid(format!("{record_id}: the entity it merged into is gone"))
     })?;
+    refuse_out_of_order(store, &row, &record)?;
 
     let b = &record.from;
     entities.insert(b, None)?;
@@ -471,6 +512,42 @@ fn revert_in(store: &Store<'_>, record_id: &str, from: &str) -> Result<RevertOut
         links_restored,
         relations_restored,
     })
+}
+
+/// Refuse a revert that a later merge depends on: one into the same
+/// entity (it may have dropped rows this revert would delete as shared), or
+/// one that absorbed the other end of a relation this revert would restore.
+/// Revert those first, newest first. A relation end deleted another way
+/// refuses too, so a revert never writes a dangling relation.
+fn refuse_out_of_order(store: &Store<'_>, row: &Memory, record: &Record) -> Result<()> {
+    let ends: HashSet<&str> = record
+        .relations
+        .iter()
+        .flat_map(|r| [r.subject_entity_id.as_str(), r.object_entity_id.as_str()])
+        .filter(|end| *end != record.from.id)
+        .collect();
+    for later in live_records(store)? {
+        if later.id == row.id || later.created_at < row.created_at {
+            continue;
+        }
+        let other = record_of(&later)?;
+        if other.into_id == record.into_id || ends.contains(other.from.id.as_str()) {
+            return Err(StoreError::Invalid(format!(
+                "merge {} came after {} and touches the same entities; revert it first",
+                later.id, row.id
+            )));
+        }
+    }
+    let entities = Entities::new(store);
+    for end in ends {
+        if !entities.exists(end)? {
+            return Err(StoreError::Invalid(format!(
+                "entity {end} that {} relates to no longer exists",
+                row.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Move B's own links back; shared ones are re-added to B and stay on A.

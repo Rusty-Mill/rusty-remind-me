@@ -395,3 +395,98 @@ fn an_alias_tie_goes_to_the_oldest_and_exact_keeps_its_own_row() {
     .unwrap();
     assert_eq!(own.id, entity_id("shared"));
 }
+
+#[test]
+fn a_revert_waits_for_a_later_merge_into_the_same_entity() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let p = pair(&store);
+    entity(&store, "mux-server", None, &[]);
+    let (_, first) = merged(entity_merge::merge(&store, "rusty-mux", "rusty_mux").unwrap());
+    let (_, second) = merged(entity_merge::merge(&store, "mux-server", "rusty_mux").unwrap());
+
+    let err = entity_merge::revert(&store, &first, "rusty-mux").unwrap_err();
+    assert!(err.to_string().contains("revert it first"), "{err}");
+
+    entity_merge::revert(&store, &second, "mux-server").unwrap();
+    entity_merge::revert(&store, &first, "rusty-mux").unwrap();
+    assert!(get_entity_by_id(&store, &p.b.id).unwrap().is_some());
+}
+
+#[test]
+fn a_revert_waits_when_a_relation_end_was_merged_since() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let p = pair(&store);
+    let x = entity(&store, "rusty_term", None, &[]);
+    entity(&store, "rusty_conhost", None, &[]);
+    upsert_entity_relation(&store, &p.b.id, "uses", &x.id).unwrap();
+    let (_, first) = merged(entity_merge::merge(&store, "rusty-mux", "rusty_mux").unwrap());
+    merged(entity_merge::merge(&store, "rusty_term", "rusty_conhost").unwrap());
+
+    let err = entity_merge::revert(&store, &first, "rusty-mux").unwrap_err();
+
+    assert!(err.to_string().contains("revert it first"), "{err}");
+}
+
+#[test]
+fn a_triple_a_has_under_an_older_id_still_blocks_the_moved_row() {
+    use remind_me_core::db::derived::Origin;
+    use remind_me_core::db::entities::RelationRow;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let p = pair(&store);
+    let x = entity(&store, "rusty_term", None, &[]);
+    Entities::new(&store)
+        .insert_relation_or_ignore(
+            &RelationRow {
+                id: "legacy-rel",
+                subject_entity_id: &p.a.id,
+                relation: "uses",
+                object_entity_id: &x.id,
+                created_at: &p.a.created_at,
+                updated_at: &p.a.created_at,
+                node_id: None,
+            },
+            Origin::Local,
+        )
+        .unwrap();
+    upsert_entity_relation(&store, &p.b.id, "Uses", &x.id).unwrap();
+
+    let (plan, _) = merged(entity_merge::merge(&store, "rusty-mux", "rusty_mux").unwrap());
+
+    assert_eq!((plan.relations_moved, plan.relations_dropped), (0, 1));
+    let ids: Vec<String> = relations(&store).into_iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec!["legacy-rel".to_string()]);
+}
+
+#[test]
+fn a_repeat_by_id_is_a_no_op_and_a_different_target_is_refused() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let p = pair(&store);
+    entity(&store, "rusty_term", None, &[]);
+    let (_, record_id) = merged(entity_merge::merge(&store, "rusty-mux", "rusty_mux").unwrap());
+
+    assert_eq!(
+        entity_merge::merge(&store, &p.b.id, "rusty_mux").unwrap(),
+        Outcome::AlreadyMerged {
+            record_id,
+            into: "rusty_mux".into()
+        }
+    );
+    let err = entity_merge::merge(&store, "rusty-mux", "rusty_term").unwrap_err();
+    assert!(err.to_string().contains("already merged into"), "{err}");
+}
+
+#[test]
+fn a_name_met_through_an_alias_never_fills_the_kind() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let a = entity(&store, "rusty_mux", None, &["mux"]);
+
+    let hit = entity(&store, "mux", Some("tag"), &[]);
+
+    assert_eq!(hit.id, a.id);
+    assert_eq!(hit.kind, None);
+}

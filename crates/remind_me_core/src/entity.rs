@@ -99,10 +99,12 @@ fn upsert_with(store: &Store<'_>, input: &EntityInput, lookup: Lookup) -> Result
     // so a casing variant misses the lookup, tries to insert, and collides on
     // the `entities.id` unique constraint.
     let entities = Entities::new(store);
-    let existing = match entities.get(&id)? {
-        Some(found) => Some(found),
-        None if lookup == Lookup::NameOrAlias => by_name_or_alias(&entities, name)?,
-        None => None,
+    // A name met through another entity's alias adds its aliases there but
+    // never fills that entity's kind: the kind was guessed for this name.
+    let (existing, may_fill_kind) = match entities.get(&id)? {
+        Some(found) => (Some(found), true),
+        None if lookup == Lookup::NameOrAlias => (by_name_or_alias(&entities, name)?, false),
+        None => (None, true),
     };
     match existing {
         None => {
@@ -125,7 +127,10 @@ fn upsert_with(store: &Store<'_>, input: &EntityInput, lookup: Lookup) -> Result
                     .chain(clean_aliases.clone()),
             );
             // Existing kind wins; `input.kind` only fills a hole.
-            let new_kind = existing.kind.clone().or_else(|| input.kind.clone());
+            let new_kind = existing
+                .kind
+                .clone()
+                .or_else(|| input.kind.clone().filter(|_| may_fill_kind));
 
             if merged != existing.aliases || new_kind != existing.kind {
                 entities.set_kind_and_aliases(&existing.id, new_kind.as_deref(), &merged, &now)?;
@@ -247,8 +252,10 @@ pub fn resolve_entity(store: &Store<'_>, query: &str) -> Result<Option<Entity>> 
         return Ok(None);
     }
 
+    // Oldest first, so an alias two entities share resolves to the same one
+    // `upsert_entity` lands it on (card #567).
     let mut alias_hit: Option<Entity> = None;
-    for entity in Entities::new(store).all()? {
+    for entity in Entities::new(store).all_oldest_first()? {
         if normalize_entity_name(&entity.name) == normalized {
             return Ok(Some(entity));
         }

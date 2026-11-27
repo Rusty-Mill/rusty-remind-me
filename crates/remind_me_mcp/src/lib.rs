@@ -2124,12 +2124,10 @@ impl McpServer {
                     // where `remind_me_entity`'s old write behaviour lives, so
                     // the capability is kept rather than dropped -- it is just
                     // no longer reachable by a call that meant to read.
-                    "remind_me_entity_upsert" => match entity_upsert(&store, args) {
-                        Ok(payload) => {
-                            let text = serde_json::to_string_pretty(&payload)
-                                .unwrap_or_else(|e| e.to_string());
-                            json!({ "content": [{ "type": "text", "text": text }] })
-                        }
+                    "remind_me_entity_upsert" => match entity_upsert(&store, args).and_then(|p| {
+                        serde_json::to_string_pretty(&p).map_err(|e| format!("Entity error: {e}"))
+                    }) {
+                        Ok(text) => json!({ "content": [{ "type": "text", "text": text }] }),
                         Err(text) => {
                             json!({ "isError": true, "content": [{ "type": "text", "text": text }] })
                         }

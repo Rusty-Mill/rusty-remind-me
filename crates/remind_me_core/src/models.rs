@@ -101,19 +101,17 @@ pub enum EntityUpsertAction<'a> {
 
 impl EntityUpsertInput {
     /// The one action these arguments name, or why they name none.
-    pub fn action(&self) -> Result<EntityUpsertAction<'_>, String> {
+    pub fn action(&self) -> Result<EntityUpsertAction<'_>, &'static str> {
         let from = self.entity.name.as_str();
         let extra = self.entity.kind.is_some() || !self.entity.aliases.is_empty();
         match (&self.merge_into, &self.revert_merge) {
-            (Some(_), Some(_)) => Err("merge_into and revert_merge cannot be combined".into()),
-            (None, None) if self.confirm => Err("confirm applies only with merge_into".into()),
+            (Some(_), Some(_)) => Err("merge_into and revert_merge cannot be combined"),
+            (None, None) if self.confirm => Err("confirm applies only with merge_into"),
             (None, None) => Ok(EntityUpsertAction::Upsert(&self.entity)),
-            _ if extra => {
-                Err("kind and aliases cannot be combined with a merge or its revert".into())
-            }
+            _ if extra => Err("kind and aliases cannot be combined with a merge or its revert"),
             (Some(into), None) if self.confirm => Ok(EntityUpsertAction::Merge { from, into }),
             (Some(into), None) => Ok(EntityUpsertAction::Preview { from, into }),
-            (None, Some(_)) if self.confirm => Err("confirm applies only with merge_into".into()),
+            (None, Some(_)) if self.confirm => Err("confirm applies only with merge_into"),
             (None, Some(record_id)) => Ok(EntityUpsertAction::Revert { record_id, from }),
         }
     }
