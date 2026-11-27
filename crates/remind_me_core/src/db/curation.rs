@@ -11,6 +11,7 @@
 //! cursor's meaning.
 
 use super::backend::BackendLock;
+use super::memories::{ListFilter, MemoryStore};
 use super::{Result, Store};
 use crate::models::{ContradictionSide, Memory};
 
@@ -59,13 +60,43 @@ pub enum Backlog {
     Unclassified,
 }
 
-/// What [`CurationStore::refine_observation`] reads.
+/// What [`super::backend::Backend::refine_observation`] reads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RefineObservation {
     pub settled_captures: i64,
     pub last_capture_at: Option<String>,
     /// The newest run record's `(id, created_at)`.
     pub last_run: Option<(String, String)>,
+}
+
+/// [`super::backend::Backend::refine_observation`] composed from existing
+/// port reads: the default for any backend, and the reference the engine
+/// and SQLite fast paths are checked against.
+///
+/// # Errors
+///
+/// The backend's error from any of the reads.
+pub fn observe_by_parts<S: CurationStore + MemoryStore + ?Sized>(
+    store: &S,
+    settled_before: Option<&str>,
+    run_category: &str,
+) -> Result<RefineObservation> {
+    let settled: std::collections::HashSet<String> = store
+        .undecomposed(usize::MAX, settled_before)?
+        .into_iter()
+        .map(|row| row.capture_id)
+        .collect();
+    let filter = ListFilter {
+        include_sensitive: true,
+        category: Some(run_category.to_string()),
+        ..ListFilter::default()
+    };
+    let (_, newest) = store.list_page(&filter, 1, 0)?;
+    Ok(RefineObservation {
+        settled_captures: i64::try_from(settled.len()).unwrap_or(i64::MAX),
+        last_capture_at: store.capture_activity()?.last_capture_at,
+        last_run: newest.into_iter().next().map(|m| (m.id, m.created_at)),
+    })
 }
 
 /// How many distinct captures there are, and when the newest was written.
@@ -92,22 +123,6 @@ pub trait CurationStore {
 
     /// How many captures [`CurationStore::undecomposed`] would list.
     fn count_undecomposed(&self, settled_before: Option<&str>) -> Result<i64>;
-
-    /// What the refinement flag reads (D104), in one call:
-    /// - `settled_captures`: how many distinct `capture_id`s
-    ///   [`CurationStore::undecomposed`] would list rows for (sessions, not
-    ///   rows), with no sorting and no [`CaptureRow`];
-    /// - `last_capture_at`: as [`CurationStore::capture_activity`] gives it;
-    /// - `last_run`: the newest live memory of `run_category` by
-    ///   `(created_at, id)`, sensitive or not, as `(id, created_at)`.
-    ///
-    /// An adapter with a narrow read reads ids and times only; the engine
-    /// has none and clones each record once (see its implementation).
-    fn refine_observation(
-        &self,
-        settled_before: Option<&str>,
-        run_category: &str,
-    ) -> Result<RefineObservation>;
 
     /// How many distinct live captures there are, and the newest one's
     /// `created_at`.
@@ -197,13 +212,17 @@ impl<'c> Curation<'c> {
         CurationStore::count_undecomposed(&*self.backend.lock()?, settled_before)
     }
 
-    /// See [`CurationStore::refine_observation`]; one lock, one call.
+    /// See [`super::backend::Backend::refine_observation`]; one lock, one call.
     pub fn refine_observation(
         &self,
         settled_before: Option<&str>,
         run_category: &str,
     ) -> Result<RefineObservation> {
-        CurationStore::refine_observation(&*self.backend.lock()?, settled_before, run_category)
+        super::backend::Backend::refine_observation(
+            &*self.backend.lock()?,
+            settled_before,
+            run_category,
+        )
     }
 
     /// See [`CurationStore::capture_activity`].
@@ -581,7 +600,7 @@ pub mod conformance {
     /// The settled-capture count matches the distinct `capture_id`s of
     /// [`CurationStore::undecomposed`] on a corpus with every case it must
     /// tell apart.
-    pub fn settled_capture_count_matches_the_undecomposed_list<S: CurationStore + MemoryStore>(
+    pub fn settled_capture_count_matches_the_undecomposed_list<S: crate::db::backend::Backend>(
         store: &mut S,
     ) {
         const OLD: &str = "2026-09-25T00:00:00+00:00";
@@ -620,7 +639,7 @@ pub mod conformance {
             MemoryStore::insert(store, row).unwrap();
         }
         let settled = |store: &S, cutoff: Option<&str>| {
-            CurationStore::refine_observation(store, cutoff, "refinement_run")
+            crate::db::backend::Backend::refine_observation(store, cutoff, "refinement_run")
                 .unwrap()
                 .settled_captures
         };
@@ -634,6 +653,12 @@ pub mod conformance {
                     .collect();
             let counted = settled(store, cutoff);
             assert_eq!(
+                crate::db::backend::Backend::refine_observation(store, cutoff, "refinement_run")
+                    .unwrap(),
+                super::observe_by_parts(store, cutoff, "refinement_run").unwrap(),
+                "fast path equals the default at cutoff {cutoff:?}"
+            );
+            assert_eq!(
                 counted,
                 listed.len() as i64,
                 "cutoff {cutoff:?}: {listed:?}"
@@ -646,7 +671,7 @@ pub mod conformance {
     /// `last_run` is the newest live run record by `(created_at, id)`,
     /// sensitive included, as a category-filtered `list_page` orders it;
     /// `last_capture_at` is `capture_activity`'s.
-    pub fn refine_observation_matches_the_separate_reads<S: CurationStore + MemoryStore>(
+    pub fn refine_observation_matches_the_separate_reads<S: crate::db::backend::Backend>(
         store: &mut S,
     ) {
         const RUN: &str = "refinement_run";
@@ -654,7 +679,7 @@ pub mod conformance {
             category: RUN.to_string(),
             ..NewMemory::new(id, "run", at)
         };
-        let empty = CurationStore::refine_observation(store, None, RUN).unwrap();
+        let empty = crate::db::backend::Backend::refine_observation(store, None, RUN).unwrap();
         assert_eq!((empty.settled_captures, empty.last_run), (0, None));
         assert_eq!(empty.last_capture_at, None);
 
@@ -683,7 +708,7 @@ pub mod conformance {
             MemoryStore::insert(store, row).unwrap();
         }
 
-        let seen = CurationStore::refine_observation(store, None, RUN).unwrap();
+        let seen = crate::db::backend::Backend::refine_observation(store, None, RUN).unwrap();
         let filter = crate::db::memories::ListFilter {
             include_sensitive: true,
             category: Some(RUN.to_string()),
@@ -700,6 +725,11 @@ pub mod conformance {
                 .last_capture_at
         );
         assert_eq!(seen.settled_captures, 1);
+        assert_eq!(
+            seen,
+            super::observe_by_parts(store, None, RUN).unwrap(),
+            "fast path equals the default"
+        );
     }
 
     pub fn contradiction_pairs_page_by_keyset<S: CurationStore + MemoryStore + EntityStore>(

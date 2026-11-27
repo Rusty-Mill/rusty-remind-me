@@ -347,58 +347,6 @@ impl CurationStore for EngineTables {
         ))
     }
 
-    /// One pass over the rows for all three observations.
-    ///
-    /// Known gap: the engine store has no narrow read. Its records live in
-    /// memory and `get` returns an owned clone of the whole record, so each
-    /// row's content is still copied once per call before it is dropped.
-    /// Nothing is sorted, collected whole or built into a `CaptureRow`. A
-    /// projection would need a borrowing accessor in
-    /// `rusty_multimodal_db_engine`; SQLite is the chosen backend (R4), so
-    /// that is not added here.
-    fn refine_observation(
-        &self,
-        settled_before: Option<&str>,
-        run_category: &str,
-    ) -> Result<RefineObservation> {
-        let (mut facts, mut captures) = (Vec::new(), Vec::new());
-        let mut last_capture_at: Option<String> = None;
-        let mut last_run: Option<(String, String)> = None;
-        for row in memories::rows(core_ref(self)?) {
-            let live = row.deleted_at.is_none();
-            if live
-                && row.capture_id.is_some()
-                && last_capture_at
-                    .as_deref()
-                    .is_none_or(|l| row.created_at.as_str() > l)
-            {
-                last_capture_at = Some(row.created_at.clone());
-            }
-            if live
-                && row.category == run_category
-                && last_run
-                    .as_ref()
-                    .is_none_or(|(id, at)| (&row.created_at, &row.id) > (at, id))
-            {
-                last_run = Some((row.id.clone(), row.created_at.clone()));
-            }
-            match stamp(&row) {
-                Some(Stamp::Fact(f)) => facts.push(f),
-                Some(Stamp::Capture(c)) => captures.push(c),
-                None => {}
-            }
-        }
-        Ok(RefineObservation {
-            settled_captures: count(count_settled_captures(
-                facts.into_iter(),
-                captures.into_iter(),
-                settled_before,
-            )),
-            last_capture_at,
-            last_run,
-        })
-    }
-
     fn capture_activity(&self) -> Result<CaptureActivity> {
         let mut captures = HashSet::new();
         let mut last: Option<String> = None;
@@ -571,6 +519,62 @@ impl CurationStore for EngineTables {
             predicate: row.predicate,
             object: row.object,
             created_at: row.created_at,
+        })
+    }
+}
+
+/// The refinement observation fast path; [`crate::db::backend::Backend`]
+/// overrides its default with it.
+impl EngineTables {
+    /// One pass over the rows for all three observations.
+    ///
+    /// Known gap: the engine store has no narrow read. Its records live in
+    /// memory and `get` returns an owned clone of the whole record, so each
+    /// row's content is still copied once per call before it is dropped.
+    /// Nothing is sorted, collected whole or built into a `CaptureRow`. A
+    /// projection would need a borrowing accessor in
+    /// `rusty_multimodal_db_engine`; SQLite is the chosen backend (R4), so
+    /// that is not added here.
+    pub(crate) fn observe_for_refine(
+        &self,
+        settled_before: Option<&str>,
+        run_category: &str,
+    ) -> Result<RefineObservation> {
+        let (mut facts, mut captures) = (Vec::new(), Vec::new());
+        let mut last_capture_at: Option<String> = None;
+        let mut last_run: Option<(String, String)> = None;
+        for row in memories::rows(core_ref(self)?) {
+            let live = row.deleted_at.is_none();
+            if live
+                && row.capture_id.is_some()
+                && last_capture_at
+                    .as_deref()
+                    .is_none_or(|l| row.created_at.as_str() > l)
+            {
+                last_capture_at = Some(row.created_at.clone());
+            }
+            if live
+                && row.category == run_category
+                && last_run
+                    .as_ref()
+                    .is_none_or(|(id, at)| (&row.created_at, &row.id) > (at, id))
+            {
+                last_run = Some((row.id.clone(), row.created_at.clone()));
+            }
+            match stamp(&row) {
+                Some(Stamp::Fact(f)) => facts.push(f),
+                Some(Stamp::Capture(c)) => captures.push(c),
+                None => {}
+            }
+        }
+        Ok(RefineObservation {
+            settled_captures: count(count_settled_captures(
+                facts.into_iter(),
+                captures.into_iter(),
+                settled_before,
+            )),
+            last_capture_at,
+            last_run,
         })
     }
 }

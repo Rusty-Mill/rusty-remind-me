@@ -192,6 +192,15 @@ impl SqliteTables {
 /// `BEGIN IMMEDIATE`, so a second writer waits and readers in other
 /// connections see it whole or not at all.
 impl Backend for SqliteTables {
+    /// Narrow reads; see [`SqliteTables::observe_for_refine`].
+    fn refine_observation(
+        &self,
+        settled_before: Option<&str>,
+        run_category: &str,
+    ) -> Result<crate::db::curation::RefineObservation> {
+        self.observe_for_refine(settled_before, run_category)
+    }
+
     fn begin_transaction(&mut self) -> Result<()> {
         self.refuse_unsettled()?;
         self.conn

@@ -142,6 +142,28 @@ pub trait Backend:
     /// The backend's error naming what could not be copied.
     fn backup_to(&self, dest: &Path) -> Result<()>;
 
+    /// What the refinement flag reads (D104), in one call:
+    /// - `settled_captures`: how many distinct `capture_id`s
+    ///   [`CurationStore::undecomposed`] lists rows for (sessions, not rows);
+    /// - `last_capture_at`: as [`CurationStore::capture_activity`] gives it;
+    /// - `last_run`: the newest live memory of `run_category` by
+    ///   `(created_at, id)`, sensitive or not, as `(id, created_at)`.
+    ///
+    /// The default composes those existing reads
+    /// ([`super::curation::observe_by_parts`]), so any backend has it; the
+    /// engine and SQLite override it with one pass and narrow reads.
+    ///
+    /// # Errors
+    ///
+    /// The backend's error from any of those reads.
+    fn refine_observation(
+        &self,
+        settled_before: Option<&str>,
+        run_category: &str,
+    ) -> Result<super::curation::RefineObservation> {
+        super::curation::observe_by_parts(self, settled_before, run_category)
+    }
+
     /// This backend's raw rows, for `crate::testing`'s helpers (D42).
     /// `None`, the default, makes those helpers refuse.
     #[doc(hidden)]

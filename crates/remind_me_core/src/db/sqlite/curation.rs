@@ -133,24 +133,6 @@ impl CurationStore for SqliteTables {
         ))
     }
 
-    fn refine_observation(
-        &self,
-        settled_before: Option<&str>,
-        run_category: &str,
-    ) -> Result<RefineObservation> {
-        let last_run = self.one(
-            "SELECT id, created_at FROM memories WHERE deleted_at IS NULL AND category = ?1 \
-             ORDER BY created_at DESC, id DESC LIMIT 1",
-            [run_category],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        Ok(RefineObservation {
-            settled_captures: self.count_settled_captures(settled_before)?,
-            last_capture_at: CurationStore::capture_activity(self)?.last_capture_at,
-            last_run,
-        })
-    }
-
     fn capture_activity(&self) -> Result<CaptureActivity> {
         Ok(self
             .one(
@@ -308,6 +290,28 @@ impl CurationStore for SqliteTables {
     }
 }
 
+/// The refinement observation fast path; [`crate::db::backend::Backend`]
+/// overrides its default with it.
+impl SqliteTables {
+    pub(crate) fn observe_for_refine(
+        &self,
+        settled_before: Option<&str>,
+        run_category: &str,
+    ) -> Result<RefineObservation> {
+        let last_run = self.one(
+            "SELECT id, created_at FROM memories WHERE deleted_at IS NULL AND category = ?1 \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            [run_category],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(RefineObservation {
+            settled_captures: self.count_settled_captures(settled_before)?,
+            last_capture_at: CurationStore::capture_activity(self)?.last_capture_at,
+            last_run,
+        })
+    }
+}
+
 #[cfg(test)]
 mod conformance_tests {
     use super::SqliteTables;
@@ -345,7 +349,7 @@ mod tests {
 
         assert!(CurationStore::undecomposed(&tables, 10, None).is_err());
         assert_eq!(
-            CurationStore::refine_observation(&tables, None, "refinement_run")
+            crate::db::backend::Backend::refine_observation(&tables, None, "refinement_run")
                 .unwrap()
                 .settled_captures,
             2
