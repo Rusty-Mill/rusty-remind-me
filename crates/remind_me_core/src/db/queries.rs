@@ -57,6 +57,7 @@ pub(crate) fn add_memory_reviewing(
     review: Review,
 ) -> Result<Memory> {
     let supersedes = input.supersedes.clone();
+    check_dead_end_source(store, fields.memory_type.as_deref(), &input.metadata)?;
     let add = PreparedAdd::new(input, fields, review)?;
     // With `supersedes`, one transaction: the insert, its index and every
     // retirement land together or not at all, and each target is checked
@@ -68,6 +69,27 @@ pub(crate) fn add_memory_reviewing(
         store.transaction(|tx| add.write(tx, &supersedes))?;
     }
     add.finish(store)
+}
+
+/// A dead end's `metadata.from` names a live memory (card #1484, D123):
+/// the decision or action item it came from. Other kinds are not checked.
+fn check_dead_end_source(
+    store: &Store<'_>,
+    kind: Option<&str>,
+    metadata: &serde_json::Value,
+) -> Result<()> {
+    if kind != Some(crate::kinds::MemoryKind::DeadEnd.as_str()) {
+        return Ok(());
+    }
+    let Some(from) = metadata.get("from").and_then(serde_json::Value::as_str) else {
+        return Ok(());
+    };
+    if Memories::new(store).get_live(from.trim())?.is_some() {
+        return Ok(());
+    }
+    Err(StoreError::Invalid(format!(
+        "dead_end metadata.from {from:?} is not a live memory id"
+    )))
 }
 
 /// An add, validated and scrubbed, split into its write and what follows
@@ -138,7 +160,7 @@ impl PreparedAdd {
             category: input.category.clone(),
             tags: input.tags.clone(),
             source: input.source.clone(),
-            metadata: input.metadata.clone(),
+            metadata: provenance.metadata(input.metadata.clone()),
             subject: input.subject.clone(),
             predicate: input.predicate.clone(),
             object: input.object.clone(),
@@ -341,6 +363,13 @@ pub fn update_memory_with(
         .map(|m| crate::consolidation::keep_evidence(m, Some(&stored.metadata)));
     let metadata = client_metadata.as_ref().unwrap_or(&stored.metadata);
     fields.validate(metadata, stored.memory_type.as_deref())?;
+    if client_metadata.is_some() || fields.memory_type.is_some() {
+        let kind = fields
+            .memory_type
+            .as_deref()
+            .or(stored.memory_type.as_deref());
+        check_dead_end_source(store, kind, metadata)?;
+    }
     // Only metadata this edit supplies: a stored value is never revalidated,
     // so an edit that leaves metadata alone cannot fail on it (pack D86).
     if let Some(supplied) = &client_metadata {
@@ -824,6 +853,34 @@ pub fn search_memories_deadlined(
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
 ) -> Result<crate::retrieval::TrimOutcome> {
+    search_ranked(store, input, embedder, deadline, false)
+}
+
+/// [`search_memories`] with dead ends left out of both ranking lanes, before
+/// their limits, so they never take a hit's place and the candidate pool
+/// stays the size `input` asks for. For a caller that shows dead ends apart,
+/// as warnings (card #1484).
+pub fn search_memories_without_dead_ends(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+) -> Result<Vec<MemorySearchResult>> {
+    let configured = crate::embedder::available_embedder();
+    let embedder = configured
+        .as_ref()
+        .map(|e| &**e as &dyn crate::embedder::Embedder);
+    let deadline = crate::retrieval::Deadline::from_env();
+    Ok(search_ranked(store, input, embedder, deadline, true)?.results)
+}
+
+/// The search behind [`search_memories_deadlined`]. `exclude_dead_ends`
+/// leaves dead ends out of both lanes, inside each before its limit.
+fn search_ranked(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+    embedder: Option<&dyn crate::embedder::Embedder>,
+    deadline: crate::retrieval::Deadline,
+    exclude_dead_ends: bool,
+) -> Result<crate::retrieval::TrimOutcome> {
     let memories_repo = Memories::new(store);
     let mut timing = crate::retrieval::SearchTiming {
         deadline_ms: deadline.limit_ms(),
@@ -868,6 +925,8 @@ pub fn search_memories_deadlined(
     // with no window either, nothing was searchable.
     // `limit` applies after `apply_validity`, so a dropped or demoted row
     // gives its place to an eligible one, as in the ranked path.
+    let skip = |m: &Memory| exclude_dead_ends && crate::dead_ends::is_dead_end(m);
+
     if phrases.is_empty() {
         let mut dormant_excluded = 0;
         let listed = if input.window.is_unbounded() {
@@ -882,6 +941,7 @@ pub fn search_memories_deadlined(
                     ..filter.clone()
                 })?
                 .into_iter()
+                .filter(|m| !skip(m))
                 .partition(|m| filter.vital_enough(m, now));
             dormant_excluded = dormant
                 .iter()
@@ -897,7 +957,7 @@ pub fn search_memories_deadlined(
             listed
         };
         if listed.is_empty() && filter.exclude_raw && !input.window.is_unbounded() {
-            return raw_fallback(store, input, embedder, deadline, timing);
+            return raw_fallback(store, input, embedder, deadline, timing, exclude_dead_ends);
         }
         let mut outcome = trim_by_token_budget(listed, input.token_budget, input.detail);
         timing.elapsed_ms = deadline.elapsed_ms();
@@ -909,7 +969,9 @@ pub fn search_memories_deadlined(
     // `RrfFusion::Score` mode needs the raw BM25 magnitude alongside each hit.
     let mut keyword_memories = Vec::new();
     let mut keyword_bm25 = std::collections::HashMap::new();
-    for (memory, bm25_score) in memories_repo.keyword_hits(&phrases, &filter, input.limit * 2)? {
+    for (memory, bm25_score) in
+        memories_repo.keyword_hits_skipping(&phrases, &filter, input.limit * 2, &skip)?
+    {
         keyword_bm25.insert(memory.id.clone(), bm25_score);
         keyword_memories.push(memory);
     }
@@ -969,6 +1031,7 @@ pub fn search_memories_deadlined(
                     && scope.matches_memory(m)
                     && input.window.contains_memory(m)
                     && narrowing.admits(m)
+                    && !skip(m)
                     // Raw rows go before the best `limit * 2` are chosen, or
                     // stronger raw hits would take every slot (ADR-0029).
                     && !(filter.exclude_raw && is_raw_category(&m.category));
@@ -1072,7 +1135,7 @@ pub fn search_memories_deadlined(
     ranked.truncate(input.limit);
 
     if ranked.is_empty() && filter.exclude_raw {
-        return raw_fallback(store, input, embedder, deadline, timing);
+        return raw_fallback(store, input, embedder, deadline, timing, exclude_dead_ends);
     }
 
     let mut outcome = trim_by_token_budget(ranked, input.token_budget, input.detail);
@@ -1146,12 +1209,13 @@ fn raw_fallback(
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
     first: crate::retrieval::SearchTiming,
+    exclude_dead_ends: bool,
 ) -> Result<crate::retrieval::TrimOutcome> {
     let raw = MemorySearchInput {
         include_raw: true,
         ..input.clone()
     };
-    let mut outcome = search_memories_deadlined(store, &raw, embedder, deadline)?;
+    let mut outcome = search_ranked(store, &raw, embedder, deadline, exclude_dead_ends)?;
     outcome.raw_fallback = !outcome.results.is_empty();
     for stage in first.skipped {
         if !outcome.timing.skipped.contains(&stage) {
@@ -1367,7 +1431,10 @@ pub fn search_with_expansions(
     // the cap should degrade to "no budget left for hits" rather than wrap to
     // an enormous one. A budget of 0 (unlimited) stays 0 here, which is right
     // — an unlimited search does not become limited by having a bootstrap.
-    let spent = bootstrap.as_ref().map_or(0, |b| b.tokens_used);
+    // Dead-end warnings spend from the budget next, like the bootstrap, and
+    // reserve at most a quarter of it (card #1484, D117).
+    let found = search_warnings(store, input)?;
+    let spent = bootstrap.as_ref().map_or(0, |b| b.tokens_used) + found.tokens;
     let hit_input;
     let hit_input = if spent == 0 {
         input
@@ -1379,13 +1446,10 @@ pub fn search_with_expansions(
         &hit_input
     };
 
-    let outcome = search_memories_budgeted(
-        store,
-        hit_input,
-        configured
-            .as_ref()
-            .map(|e| &**e as &dyn crate::embedder::Embedder),
-    )?;
+    let embedder = configured
+        .as_ref()
+        .map(|e| &**e as &dyn crate::embedder::Embedder);
+    let outcome = hits_without_warned(store, hit_input, embedder, &found.warnings)?;
     let memories = outcome.results;
     let ids: Vec<String> = memories.iter().map(|r| r.memory.id.clone()).collect();
 
@@ -1419,6 +1483,8 @@ pub fn search_with_expansions(
         dormant_excluded: outcome.dormant_excluded,
         bootstrap,
         inferred_window,
+        warnings: found.warnings,
+        warnings_omitted: found.omitted,
         memories,
         total_candidates: outcome.total_candidates,
         returned: outcome.returned,
@@ -1436,6 +1502,92 @@ pub fn search_with_expansions(
     crate::vitality::record_accesses(store, &ids)?;
 
     Ok(response)
+}
+
+/// The ranked hits less any dead end already shown as a warning (card
+/// #1484). The warned ids are dropped before `limit` and the token budget
+/// apply, so the remaining matches fill the page and the envelope counts only
+/// what is returned.
+fn hits_without_warned(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+    embedder: Option<&dyn crate::embedder::Embedder>,
+    warnings: &[crate::dead_ends::Warning],
+) -> Result<crate::retrieval::TrimOutcome> {
+    if warnings.is_empty() {
+        return search_memories_budgeted(store, input, embedder);
+    }
+    let warned: std::collections::HashSet<&str> = warnings.iter().map(|w| w.id.as_str()).collect();
+    let wide = MemorySearchInput {
+        limit: input.limit + warned.len(),
+        token_budget: 0,
+        ..input.clone()
+    };
+    let raw = search_memories_budgeted(store, &wide, embedder)?;
+    let mut kept: Vec<_> = raw
+        .results
+        .into_iter()
+        .filter(|r| !warned.contains(r.memory.id.as_str()))
+        .collect();
+    kept.truncate(input.limit);
+    let mut outcome = trim_by_token_budget(kept, input.token_budget, input.detail);
+    outcome.timing = raw.timing;
+    outcome.raw_fallback = raw.raw_fallback;
+    outcome.dormant_excluded = raw.dormant_excluded;
+    Ok(outcome)
+}
+
+/// A search's dead-end warnings and the tokens they spend.
+struct SearchWarnings {
+    warnings: Vec<crate::dead_ends::Warning>,
+    omitted: usize,
+    tokens: usize,
+}
+
+/// The dead ends a search's query repeats (card #1484, D116-D117): at most
+/// [`crate::dead_ends::SEARCH_LIMIT`], within a quarter of the token budget
+/// (none dropped when it is unlimited). A listing (empty query) has none.
+fn search_warnings(store: &Store<'_>, input: &MemorySearchInput) -> Result<SearchWarnings> {
+    let query = input.query.trim();
+    if query.is_empty() {
+        return Ok(SearchWarnings {
+            warnings: Vec::new(),
+            omitted: 0,
+            tokens: 0,
+        });
+    }
+    let request = crate::dead_ends::Request {
+        query: Some(query),
+        project: input.scope.project.as_deref(),
+        include_sensitive: input.include_sensitive,
+    };
+    let found = crate::dead_ends::find(
+        store,
+        &request,
+        crate::dead_ends::SEARCH_LIMIT,
+        Utc::now(),
+        &|_| true,
+    )?;
+    let reserve = input.token_budget / 4;
+    let mut kept = Vec::new();
+    let mut tokens = 0;
+    let mut omitted = found.omitted;
+    for warning in found.warnings {
+        let cost = crate::retrieval::estimated_content_tokens(
+            &serde_json::to_string(&warning).unwrap_or_default(),
+        );
+        if input.token_budget > 0 && tokens + cost > reserve {
+            omitted += 1;
+            continue;
+        }
+        tokens += cost;
+        kept.push(warning);
+    }
+    Ok(SearchWarnings {
+        warnings: kept,
+        omitted,
+        tokens,
+    })
 }
 
 /// A page of memories awaiting extraction, newest first.

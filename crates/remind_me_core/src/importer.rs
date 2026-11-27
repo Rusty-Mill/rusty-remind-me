@@ -1470,7 +1470,7 @@ pub fn import_content(
             category: category.to_string(),
             tags: chunk_tags,
             source: source.to_string(),
-            metadata,
+            metadata: provenance.metadata(metadata),
             doc_id: Some(import_id.clone()),
             chunk_index: Some(chunk_index as i64),
             ..provenance.stamp(NewMemory::new(memory_id.clone(), content.clone(), &now))

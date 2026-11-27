@@ -427,7 +427,7 @@ pub fn pull_mempalace(
                 category: mem_category,
                 tags: mem_tags,
                 source: mem_source,
-                metadata,
+                metadata: provenance.metadata(metadata),
                 created_at,
                 ..provenance.stamp(NewMemory::new(memory_id.clone(), content, &now))
             })?;

@@ -1307,7 +1307,7 @@ fn append_continuation(
         category: crate::models::DIALOG_CATEGORY.to_string(),
         tags,
         source: first.source.clone(),
-        metadata,
+        metadata: provenance.metadata(metadata),
         capture_id: first.capture_id.clone(),
         memory_type: first
             .memory_type

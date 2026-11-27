@@ -547,6 +547,24 @@ pub trait MemoryStore {
         limit: usize,
     ) -> Result<Vec<(Memory, f64)>>;
 
+    /// [`MemoryStore::keyword_hits`], also leaving out the memories `skip`
+    /// matches, before `limit`, so they never take a hit's place. Both
+    /// backends override this; the default skips after the limit and so may
+    /// return fewer than `limit`.
+    fn keyword_hits_skipping(
+        &self,
+        phrases: &[String],
+        filter: &KeywordFilter,
+        limit: usize,
+        skip: &dyn Fn(&Memory) -> bool,
+    ) -> Result<Vec<(Memory, f64)>> {
+        Ok(self
+            .keyword_hits(phrases, filter, limit)?
+            .into_iter()
+            .filter(|(memory, _)| !skip(memory))
+            .collect())
+    }
+
     /// Every live, unsuperseded memory `filter` admits, newest first on its
     /// window's timestamp (ties by id). Serves a search with a time window and
     /// no query text, where there is nothing to rank. Unlimited, because the
@@ -606,14 +624,22 @@ impl<'c> Memories<'c> {
         }
     }
 
-    /// See [`MemoryStore::insert`].
+    /// See [`MemoryStore::insert`]. Counts the row for
+    /// [`crate::clients::note_write`] once it is inserted.
     pub fn insert(&self, row: &NewMemory) -> Result<()> {
-        MemoryStore::insert(&mut *self.backend.lock()?, row)
+        MemoryStore::insert(&mut *self.backend.lock()?, row)?;
+        crate::clients::note_write(&row.client);
+        Ok(())
     }
 
-    /// See [`MemoryStore::insert_or_ignore`].
+    /// See [`MemoryStore::insert_or_ignore`]. Counts the row for
+    /// [`crate::clients::note_write`] only when it was inserted.
     pub fn insert_or_ignore(&self, row: &NewMemory) -> Result<bool> {
-        MemoryStore::insert_or_ignore(&mut *self.backend.lock()?, row)
+        let inserted = MemoryStore::insert_or_ignore(&mut *self.backend.lock()?, row)?;
+        if inserted {
+            crate::clients::note_write(&row.client);
+        }
+        Ok(inserted)
     }
 
     /// See [`MemoryStore::upsert_synced`].
@@ -816,6 +842,17 @@ impl<'c> Memories<'c> {
         limit: usize,
     ) -> Result<Vec<(Memory, f64)>> {
         MemoryStore::keyword_hits(&*self.backend.lock()?, phrases, filter, limit)
+    }
+
+    /// See [`MemoryStore::keyword_hits_skipping`].
+    pub fn keyword_hits_skipping(
+        &self,
+        phrases: &[String],
+        filter: &KeywordFilter,
+        limit: usize,
+        skip: &dyn Fn(&Memory) -> bool,
+    ) -> Result<Vec<(Memory, f64)>> {
+        MemoryStore::keyword_hits_skipping(&*self.backend.lock()?, phrases, filter, limit, skip)
     }
 
     /// See [`MemoryStore::window_hits`].
