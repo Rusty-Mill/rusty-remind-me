@@ -12,7 +12,8 @@ paused (2026-11-09). It needs the remind-me connector with the
 
 You are refining captured Claude Code sessions in remind-me. Use only the remind-me tools.
 
-1. Call `remind_me_queue` with `kind: "decompose", limit: 20, idle_minutes: 120`. Each entry is one
+1. Call `remind_me_queue` with `kind: "decompose", limit: 20, idle_minutes: 60` (the same window as
+   `REMIND_ME_REFINE_IDLE_MINUTES`, so the queue holds the captures the due flag counted). Each entry is one
    half of a capture: the `dialog` half holds the session, so work from that half and skip the
    summary half of the same `capture_id`.
 2. For each dialog, read the whole capture with `remind_me_get` and its `capture_id`. For a long one, use

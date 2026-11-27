@@ -39,6 +39,11 @@ pub const MIN_BACKLOG_DEFAULT: u32 = 50;
 pub const COOLDOWN_HOURS_DEFAULT: u32 = 8;
 pub const IDLE_MINUTES_DEFAULT: u32 = 60;
 
+/// Largest cooldown accepted: a year. Keeps timestamp arithmetic in range.
+pub const COOLDOWN_HOURS_MAX: u32 = 24 * 366;
+/// Largest idle window accepted: a year.
+pub const IDLE_MINUTES_MAX: u32 = 60 * 24 * 366;
+
 /// The thresholds, from the environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
@@ -68,19 +73,27 @@ impl Settings {
     /// [`Settings::from_env`] over any lookup, so it is testable without
     /// touching the process environment.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
-        let read = |name: &str, default: u32| -> Result<u32, String> {
-            match lookup(name).map(|v| v.trim().to_string()) {
-                None => Ok(default),
-                Some(v) if v.is_empty() => Ok(default),
+        let read = |name: &str, default: u32, max: u32| -> Result<u32, String> {
+            let value = match lookup(name).map(|v| v.trim().to_string()) {
+                None => return Ok(default),
+                Some(v) if v.is_empty() => return Ok(default),
                 Some(v) => v
                     .parse::<u32>()
-                    .map_err(|_| format!("{name}={v:?} is not a whole number")),
+                    .map_err(|_| format!("{name}={v:?} is not a whole number"))?,
+            };
+            if value > max {
+                return Err(format!("{name}={value} is above the maximum, {max}"));
             }
+            Ok(value)
         };
         Ok(Self {
-            min_backlog: read(MIN_BACKLOG_ENV, MIN_BACKLOG_DEFAULT)?,
-            cooldown_hours: read(COOLDOWN_HOURS_ENV, COOLDOWN_HOURS_DEFAULT)?,
-            idle_minutes: read(IDLE_MINUTES_ENV, IDLE_MINUTES_DEFAULT)?,
+            min_backlog: read(MIN_BACKLOG_ENV, MIN_BACKLOG_DEFAULT, u32::MAX)?,
+            cooldown_hours: read(
+                COOLDOWN_HOURS_ENV,
+                COOLDOWN_HOURS_DEFAULT,
+                COOLDOWN_HOURS_MAX,
+            )?,
+            idle_minutes: read(IDLE_MINUTES_ENV, IDLE_MINUTES_DEFAULT, IDLE_MINUTES_MAX)?,
         })
     }
 }
@@ -202,8 +215,15 @@ fn observe(
 ) -> crate::db::Result<(Observed, Option<String>)> {
     let curation = Curation::new(store);
     let settled_before = (now - Duration::minutes(i64::from(settings.idle_minutes))).to_rfc3339();
-    let settled_backlog =
-        u64::try_from(curation.count_undecomposed(Some(&settled_before))?).unwrap_or(0);
+    // One capture writes a dialog and a summary under one `capture_id` (and
+    // a continued transcript may add more), so count distinct captures, not
+    // rows: the threshold is in sessions.
+    let settled_backlog = curation
+        .undecomposed(usize::MAX, Some(&settled_before))?
+        .into_iter()
+        .map(|row| row.capture_id)
+        .collect::<std::collections::HashSet<_>>()
+        .len() as u64;
     let last_capture_at = curation
         .capture_activity()?
         .last_capture_at
@@ -384,6 +404,10 @@ mod tests {
         );
         let err = Settings::from_lookup(env(&[(COOLDOWN_HOURS_ENV, "8h")])).unwrap_err();
         assert!(err.contains(COOLDOWN_HOURS_ENV), "{err}");
+        let huge = Settings::from_lookup(env(&[(COOLDOWN_HOURS_ENV, "4294967295")])).unwrap_err();
+        assert!(huge.contains("maximum"), "{huge}");
+        let idle = Settings::from_lookup(env(&[(IDLE_MINUTES_ENV, "4294967295")])).unwrap_err();
+        assert!(idle.contains(IDLE_MINUTES_ENV), "{idle}");
     }
 
     #[test]

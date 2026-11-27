@@ -5,10 +5,10 @@ Dated entries, newest first. One entry per merged pull request.
 ## 2026-11-27 — Refinement runs when there is enough material, and each run leaves a record (Mill Board #1554, D104)
 
 ### Added
-- `refine` in `remind_me_server_status`: `state` is `due`, `backlog` (with `needed`), `cooldown` or `active` (with `until`), or `misconfigured` (with `reason`), plus `settled_backlog`, `last_run_at` and `last_run_id`. A run is due when at least `REMIND_ME_REFINE_MIN_BACKLOG` (default 50) captures are undecomposed and unchanged for the idle window, `REMIND_ME_REFINE_COOLDOWN_HOURS` (8) have passed since the newest run record, and nothing was captured for `REMIND_ME_REFINE_IDLE_MINUTES` (60). New captures reset the idle clock, so they cancel a due run. A threshold that is not a whole number is reported by name rather than replaced with the default.
+- `refine` in `remind_me_server_status`: `state` is `due`, `backlog` (with `needed`), `cooldown` or `active` (with `until`), or `misconfigured` (with `reason`), plus `settled_backlog`, `last_run_at` and `last_run_id`. A run is due when at least `REMIND_ME_REFINE_MIN_BACKLOG` (default 50) captures (distinct sessions, not dialog/summary rows) are undecomposed and unchanged for the idle window, `REMIND_ME_REFINE_COOLDOWN_HOURS` (8) have passed since the newest run record, and nothing was captured for `REMIND_ME_REFINE_IDLE_MINUTES` (60). New captures reset the idle clock, so they cancel a due run. A threshold that is not a whole number, or above its maximum (a year for the cooldown and idle window), is reported by name rather than replaced with the default.
 - The maintenance nudge adds "refinement due: N settled captures" when a run is due.
 - The run record: a `refinement_run` memory whose `metadata.run` holds `decomposed`, `created`, `superseded` and `promoted` id arrays and `started_at`/`finished_at`. Add refuses a record without the object or the two times, or with a non-array id list, naming the key. The newest record starts the cooldown.
-- `docs/routines/session-ladder.md`: started by a person when a run is due, and a new step that writes the record.
+- `docs/routines/session-ladder.md`: started by a person when a run is due, its queue window now matches the idle window (60 minutes, was 120), and a new step writes the record.
 
 ### Not changed
 - Nothing starts a run: no background model call, and the daily routine stays paused (D104, D16's reason).

@@ -10,17 +10,21 @@ use remind_me_core::refine::{status, Due, RUN_CATEGORY};
 use remind_me_core::{Database, MemoryAddInput};
 use serde_json::{json, Value};
 
-/// `count` captures last touched two days ago, so settled and idle.
+/// `count` captures last touched two days ago, so settled and idle. Each
+/// is a dialog and a summary under one `capture_id`, as `auto_capture`
+/// writes them.
 fn settled_captures(store: &Store<'_>, count: usize) {
     let then = (Utc::now() - Duration::days(2)).to_rfc3339();
     for i in 0..count {
-        Memories::new(store)
-            .insert(&NewMemory {
-                category: "dialog".to_string(),
-                capture_id: Some(format!("cap_{i:03}")),
-                ..NewMemory::new(format!("mem_cap_{i:03}"), "a session", &then)
-            })
-            .unwrap();
+        for (half, category) in [("d", "dialog"), ("s", "summary")] {
+            Memories::new(store)
+                .insert(&NewMemory {
+                    category: category.to_string(),
+                    capture_id: Some(format!("cap_{i:03}")),
+                    ..NewMemory::new(format!("mem_cap_{i:03}_{half}"), "a session", &then)
+                })
+                .unwrap();
+        }
     }
 }
 
@@ -52,6 +56,20 @@ fn an_empty_store_waits_on_the_backlog() {
         }
     );
     assert_eq!(s.last_run_id, None);
+}
+
+#[test]
+fn the_backlog_counts_sessions_not_rows() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    settled_captures(&store, 49);
+    assert_eq!(
+        status(&store, Utc::now()).due,
+        Due::Backlog {
+            settled_backlog: 49,
+            needed: 50
+        }
+    );
 }
 
 #[test]
