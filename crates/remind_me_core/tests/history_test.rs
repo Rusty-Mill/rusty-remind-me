@@ -43,6 +43,7 @@ fn update(store: &Store<'_>, id: &str, content: Option<&str>, category: Option<&
         &MemoryUpdateInput {
             project: None,
             memory_id: id.to_string(),
+            if_version: None,
             clear_superseded: false,
             content: content.map(str::to_string),
             category: category.map(str::to_string),
@@ -172,6 +173,7 @@ fn reverting_restores_every_tracked_field_together() {
         &MemoryUpdateInput {
             project: None,
             memory_id: id.clone(),
+            if_version: None,
             clear_superseded: false,
             content: Some("rewritten".into()),
             category: Some("engineering".into()),

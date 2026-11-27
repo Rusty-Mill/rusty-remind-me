@@ -131,8 +131,20 @@ pick up a new stdio server until it restarts.
 The default is `core`. Set a comma list such as
 `REMIND_ME_TOOL_PROFILE=core,wiki`; `full` is every group and `standard` is
 `core,pipeline,wiki`. To get the old surface back, set
-`REMIND_ME_TOOL_PROFILE=full`. Small local models do best on plain `core`. Tool names merged away in 0.5 still work
+`REMIND_ME_TOOL_PROFILE=full`. Small local models get `minimal`: only
+search, get, add, auto_capture and brief (`minimal,wiki` adds a group;
+`minimal,core` is `core`). Tool names merged away in 0.5 still work
 until 0.6.0 but are no longer listed.
+
+A client registered in `clients.json` (`REMIND_ME_CLIENTS_FILE`) can carry its
+own `profile`, `format` (the default `response_format` on every tool that takes
+one) and `brief_budget` (`remind_me_brief`'s default `token_budget`). Those beat
+`REMIND_ME_TOOL_PROFILE` and `REMIND_ME_DEFAULT_RESPONSE_FORMAT`, per caller,
+including over the remote connector:
+
+```json
+{ "hermes-jarvis": { "profile": "minimal", "format": "json", "brief_budget": 600 } }
+```
 
 ### 3. Verify end to end
 
@@ -574,6 +586,16 @@ rusty-remind-me brief rusty_mux --since 2d --budget 1500
 ```
 The name resolves through the entity graph, so an alias works, and a memory is in scope when its project, its git remote's repository, a tag, its subject or object, or an entity link names the project. An unknown name is refused with the closest known names, never guessed. `--since` takes `7d` (the default), `12h`, an RFC 3339 time or a date phrase such as `yesterday` or `last week` (its start); `--budget` is in tokens (200 to 8,000) and bounds the returned text, JSON or Markdown, by the same bytes/4 estimate search uses; items that do not fit are dropped whole and counted, and a budget too small even for the header is refused with the size it needs. `--json` prints the brief's JSON instead of its Markdown. Sensitive, superseded and expired memories never appear, and never make a name known or suggested. The same brief is the MCP tool `remind_me_brief` (in the `core` profile, JSON by default) and `GET /api/brief`.
 
+#### Mutes
+Stop an entity, topic or tag from coming up unasked:
+```bash
+rusty-remind-me mute entity Gary            # every project
+rusty-remind-me mute tag offsite --project alpha
+rusty-remind-me unmute entity Gary
+rusty-remind-me mutes                       # every mute, on or off
+```
+A muted memory leaves the session and project briefs, the prompt hook, the digest (which counts what it left out) and dead-end warnings. An explicit search still finds it and marks the hit `"muted": true`. A mute is an ordinary `preference` memory in category `mute` with `metadata.mute = {target, value, on, project?}`, so it shows in history and can be written with `remind_me_add` too; the entity or topic must exist. Unmuting turns the record off rather than deleting it. A brief about a project never mutes that project's own entity.
+
 ### 9. Knowledge Graph Entity Management
 Upserts an entity with optional category/kind classification:
 ```bash
@@ -729,8 +751,8 @@ surfaces):
 | `GET` | `/api/stats` | Dashboard-level memory statistics |
 | `GET` | `/api/memories` | List memories |
 | `POST` | `/api/memories` | Store a new memory (`MemoryAddInput` JSON body) |
-| `GET` | `/api/memories/{memory_id}` | Fetch one memory by ID |
-| `PUT`, `PATCH` | `/api/memories/{memory_id}` | Update a memory |
+| `GET` | `/api/memories/{memory_id}` | Fetch one memory by ID, with its `version` |
+| `PUT`, `PATCH` | `/api/memories/{memory_id}` | Update a memory; optional `if_version` (see below) |
 | `DELETE` | `/api/memories/{memory_id}` | Delete a memory |
 | `GET` | `/api/memories/search?q=...&limit=...` | Search memories — query params, not a POST body |
 | `POST` | `/api/memories/bulk/delete`, `/bulk/tag`, `/bulk/reclassify` | Bulk operations over a set of memory IDs |
@@ -741,7 +763,7 @@ surfaces):
 | `GET` | `/api/export` | Export memories |
 | `GET` | `/api/entity`, `/api/entities`, `/api/entity/traverse` | Knowledge-graph entity endpoints |
 | `GET` | `/api/wiki`, `/api/wiki/search`, `/api/wiki/load`, `/api/wiki/status`, `/api/wiki/{slug}` | Markdown wiki endpoints |
-| `POST` | `/api/wiki` | Create or replace a page — `{"title": ..., "content": ..., "log_note": ...}` (`remind_me_wiki_write`) |
+| `POST` | `/api/wiki` | Create or replace a page — `{"title": ..., "content": ..., "log_note": ..., "if_version": ...}` (`remind_me_wiki_write`) |
 | `DELETE` | `/api/wiki/{slug}` | Delete a page and its index rows (`remind_me_wiki_delete`) |
 | `POST` | `/api/wiki/compile` | Compile brief; `{"mark_integrated": true, "through": <brief's through>}` advances the watermark (`remind_me_wiki_compile`) |
 | `GET` | `/api/wiki/schema` | The maintainer schema the compile brief embeds |
@@ -755,6 +777,14 @@ surfaces):
 | `GET` | `/api/saved-searches/{name}/run` | Re-run a saved search's stored query and filters (`remind_me_run_saved_search`) |
 | `DELETE` | `/api/saved-searches/{name}` | Delete one, with its watch-tracking rows (`remind_me_delete_saved_search`) |
 | `GET` | `/metrics`, `/manifest.json`, `/` | Metrics, PWA manifest, and the dashboard itself |
+
+**Version checks (#1487).** A memory, a wiki page (`GET /api/wiki/{slug}`)
+and a project (`action=get`) are read with a `version`. Pass it back as
+`if_version` on the memory update, the wiki write (where `"absent"` means
+"create only") or a project `set`/`revert`: if the target changed since, the
+answer is 409 with `{"error": {"code": "version_conflict", ...},
+"current_version": ...}` and nothing is written. The MCP tools take the same
+field and return the same body. Without `if_version`, the last write wins.
 
 Each of the reminder, digest, status, saved-search and wiki routes calls the
 same `remind_me_core` function its MCP tool does, so a reminder set from the

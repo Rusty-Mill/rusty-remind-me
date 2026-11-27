@@ -190,6 +190,37 @@ pub(super) fn rows_where(
     rows.collect::<rusqlite::Result<_>>().map_err(sqlite_error)
 }
 
+/// The first `limit` rows of [`rows_where`]'s result that `keep` accepts,
+/// read one at a time and no further than needed.
+pub(super) fn first_rows_where(
+    conn: &Connection,
+    clause: &str,
+    order: &str,
+    bind: &[Sql],
+    limit: usize,
+    keep: &dyn Fn(&MemoryRow) -> bool,
+) -> Result<Vec<MemoryRow>> {
+    let sql = format!(
+        "SELECT {} FROM memories WHERE {clause} ORDER BY {order}",
+        columns()
+    );
+    let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map(params_from_iter(bind), memory_row)
+        .map_err(sqlite_error)?;
+    let mut kept = Vec::new();
+    for row in rows {
+        if kept.len() >= limit {
+            break;
+        }
+        let row = row.map_err(sqlite_error)?;
+        if keep(&row) {
+            kept.push(row);
+        }
+    }
+    Ok(kept)
+}
+
 /// Memory `id`'s row, if there is one.
 pub(super) fn stored(conn: &Connection, id: &str) -> Result<Option<MemoryRow>> {
     Ok(rows_where(conn, "id = ?1", "id", &[Sql::Text(id.to_string())])?.pop())

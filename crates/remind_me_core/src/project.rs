@@ -778,7 +778,46 @@ fn entity_ref(store: &Store<'_>, subject: &str) -> Result<EntityRef> {
 /// skipped and reported in [`WriteOutcome::unchanged`]. The writes happen in
 /// one transaction: a failure part way leaves nothing behind.
 pub fn set(store: &Store<'_>, input: &SetInput) -> Result<WriteOutcome> {
-    store.transaction(|page| set_in(page, input))
+    set_if(store, input, None)
+}
+
+/// [`set`], written only if the project's version is still the one
+/// `expect` names (#1487). Checked inside the write's transaction.
+///
+/// # Errors
+///
+/// [`StoreError::Conflict`] with the current version when it moved.
+pub fn set_if(
+    store: &Store<'_>,
+    input: &SetInput,
+    expect: Option<&crate::version::Expect>,
+) -> Result<WriteOutcome> {
+    store.transaction(|page| {
+        check_version(page, &input.project, expect)?;
+        set_in(page, input)
+    })
+}
+
+/// The project's version: its claim ids, sorted. Claims are append-only, so
+/// any `set` or `revert` changes it. A name with no claims has the version
+/// of an empty chain.
+pub fn version(store: &Store<'_>, name: &str) -> Result<String> {
+    let subject = canonical_subject(store, name)?;
+    let chain = claims_for(store, &subject)?;
+    let mut ids: Vec<&str> = chain.iter().map(|m| m.id.as_str()).collect();
+    ids.sort_unstable();
+    Ok(crate::version::of_ids(ids))
+}
+
+fn check_version(
+    store: &Store<'_>,
+    name: &str,
+    expect: Option<&crate::version::Expect>,
+) -> Result<()> {
+    if expect.is_none() {
+        return Ok(());
+    }
+    crate::version::check(expect, Some(&version(store, name)?))
 }
 
 fn set_in(store: &Store<'_>, input: &SetInput) -> Result<WriteOutcome> {
@@ -897,7 +936,23 @@ fn set_in(store: &Store<'_>, input: &SetInput) -> Result<WriteOutcome> {
 /// reverts. Refused when the claim is not current or nothing earlier differs.
 /// Like [`set`], it writes in one transaction.
 pub fn revert(store: &Store<'_>, input: &RevertInput) -> Result<WriteOutcome> {
-    store.transaction(|page| revert_in(page, input))
+    revert_if(store, input, None)
+}
+
+/// [`revert`] with the same version precondition as [`set_if`].
+///
+/// # Errors
+///
+/// [`StoreError::Conflict`] with the current version when it moved.
+pub fn revert_if(
+    store: &Store<'_>,
+    input: &RevertInput,
+    expect: Option<&crate::version::Expect>,
+) -> Result<WriteOutcome> {
+    store.transaction(|page| {
+        check_version(page, &input.project, expect)?;
+        revert_in(page, input)
+    })
 }
 
 fn revert_in(store: &Store<'_>, input: &RevertInput) -> Result<WriteOutcome> {

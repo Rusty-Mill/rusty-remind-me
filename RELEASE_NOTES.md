@@ -18,6 +18,57 @@ Dated entries, newest first. One entry per merged pull request.
 ### Tests
 - Core (`tests/entity_merge_test.rs`, 18): preview writes nothing; merge moves links, names and kind; an existing kind is kept; relations both ways with self-loop and duplicate dropped; idempotent repeat; revert restores exactly and refuses a second time; revert keeps later links and skips deleted memories; revert checks the name; self, topic and project refusals; project claims refuse; a later mention lands on the survivor; alias ties and the exact upsert; out-of-order reverts refused; a legacy-id triple blocks a duplicate; repeat by id and a different target; no kind fill through an alias. MCP: preview, confirm, repeat, revert and refused argument mixes. Conformance: `delete_relation` on engine and SQLite.
 
+## 2026-11-27 — Mutes: stop bringing something up unasked (Mill Board #1485, D118, D124)
+
+### Added
+- Mutes on an entity, a topic (and its subtree) or a tag, global or per project. A mute is a `preference` memory in category `mute` with `metadata.mute = {target: entity|topic|tag, value, on, project?}`; writes in that category are checked (preference kind, valid spec, entity or topic exists, a `topic:` name refused as an entity). No schema change, no new tool.
+- CLI: `rusty-remind-me mute|unmute <entity|topic|tag> <VALUE> [--project NAME]` and `rusty-remind-me mutes`. Muting again re-enables the existing record; unmuting turns it off and keeps it.
+- Muted memories leave the session and project briefs, the prompt hook (hits and dead-end warnings; muted memories and mute records are left out inside its search, before the hit limit, so they never take a real hit's place), reminders and persona lines in the session brief (left out before their caps; with no mutes the reminders read is the same single 50-row read, and with mutes `ReminderStore::in_window_where`, a new provided trait method, rejects muted and out-of-horizon reminders in one pass before the cap, judging the horizon by parsed time rather than stored text order) and the digest's recent memories (`muted_hidden` counts them; the Markdown says so). Mute records are never listed there and consolidation leaves them alone.
+- An explicit `remind_me_search` still returns muted memories and marks each `"muted": true` (full and compact JSON) with a Markdown note. A project brief never mutes its own project entity.
+
+### Tests
+- Muted entity, tag and topic leave the brief; search still finds and marks; unmute restores and re-muting reuses the record; project scoping; digest count; validation; CLI parsing; muted matches not crowding an eligible prompt hit out; muted reminders (60 and 130) not crowding an eligible one out; a reminder stored at another offset judged by its time; `in_window_where` filtering before the limit on both backends; a muted persona line leaving the session brief.
+
+## 2026-11-27 — Dialog store check on open (Mill Board #528, D132)
+
+### Added
+- `dialog_reconcile::check`: a read-only check of the dialog store against `memories`. It lists, by id, rows whose body blob is missing or the wrong size (`--full` also re-hashes each blob), rows with no live `memories` dialog row, and rows whose `memories` row has a different canonical hash (D77). It counts `memories` dialog rows the store does not hold yet as `not_migrated`, which is not a finding until the migration runs. Nothing is repaired, appended or deleted (D80).
+- On open, the daemon and the stdio server run the quick check once on a background thread when a dialog store exists, and log one summary line with the counts and the time taken. They never wait for it. Counters `runs()` and `last_findings()` sit beside `dialog_shadow::failures()`.
+- `rusty-remind-me dialogs check [--full]` prints the report as JSON and exits 1 when there are findings.
+- `docs/handoff`: D132 (this slice's shape) and Q35 (whether the counts join `remind_me_server_status`, which is an MCP output change under D3, so it is left out).
+
+### Tests
+- No store means no report, no thread and no file created; a shadowed store is clean, with unshadowed rows only counted; each problem kind is listed by id; only `--full` sees a same-size corruption; the check changes no file; the background pass runs once and counts; CLI argument parsing.
+
+## 2026-11-27 — Version checks so clients can't overwrite each other (Mill Board #1487, D119-D122, D125)
+
+### Added
+- `version` on reads: `remind_me_get` (each memory, with `memory_id` or `memory_ids`), the `remind_me_add` and `remind_me_update` replies, `remind_me_wiki_read` and the wiki write reply, `remind_me_project` `get`/`set`/`revert`, and their REST routes (`GET`/`PATCH /api/memories/{id}`, `GET /api/wiki/{slug}`, `POST /api/wiki`, `/api/projects`). It is `v1:` plus 16 hex characters of SHA-256 over what a write can change, computed on read and never stored: no schema or record change.
+- Optional `if_version` on `remind_me_update`, `remind_me_wiki_write` (`"absent"` = create only) and `remind_me_project` `set`/`revert`, and on the same REST routes. On a mismatch nothing is written: MCP returns the ADR-0028 error `version_conflict` with `current_version` (and `updated_at` for a memory or page); REST answers 409 with the same body. A malformed value is refused as invalid input before any read. Without it, the last write wins as before.
+- `StoreError::Conflict { current_version }`, `remind_me_core::version`.
+
+### Changed
+- A memory update now reads, checks and writes in one transaction (it read outside it before). Project `set`/`revert` check inside their existing transaction. A wiki page is written to a temporary file and renamed into place; an edit made in an editor between the check and the rename is the one race a file leaves.
+
+### Tests
+- Match writes, mismatch writes nothing (row, revision count, page, claim chain), absent precondition, malformed value, two writers holding one version on the Engine and SQLite backends (exactly one wins), and the same code and body over MCP and REST.
+
+## 2026-11-27 — Per-client tool profile, format and brief budget; the `minimal` profile (Mill Board #1552 PR B, ADR-0028 step 3, D126-D131)
+
+### Added
+- `minimal` tool profile: search, get, add, auto_capture and brief only, for small local models. Before this, `minimal` was unrecognised and fell back to `full`. `minimal,<group>` adds a group; any part that turns on core (`core`, `standard`, `full`) wins. An alias works exactly when the tool it merged into is listed. A preset, not a group (ADR-0030 amended).
+- `clients.json` entries take `profile`, `format` (`markdown` or `json`) and `brief_budget` (200 to 8000), checked at load; a bad value makes the registry unusable with the reason.
+- For the resolved caller, the registry `profile` beats `REMIND_ME_TOOL_PROFILE`, `format` is the default `response_format` on every tool that takes one (an explicit value still wins), and `brief_budget` is `remind_me_brief`'s `token_budget` when the call sends none.
+- The remote connector lists tools per caller (`tools_for`), so the list matches what that caller may call.
+- A refused tool names the setting that turns it on: the client's `profile` in `clients.json` when the profile came from there, else `REMIND_ME_TOOL_PROFILE`. `remind_me_server_status`'s `tool_profile` gains `tools` (the count).
+
+### Unchanged
+- With no registry, or a client it does not list, profile and format resolve as before. No tool is renamed or removed; no schema change.
+- Not yet: the ADR-0028 §3 CI test over descriptions and schemas (with #52/#54, D130).
+
+### Tests
+- `minimal` lists exactly five tools and refuses core ones with the remedy; `minimal,wiki`, `minimal,core`, `minimal,standard`; a registered profile beats the env and its refusal names the registry; an unlisted client keeps the env profile; a registered format becomes search's default and an explicit one wins; a registered brief budget is the default and an explicit one wins; registry field validation.
+
 ## 2026-11-27 — Dead ends that warn before they're repeated (Mill Board #1484, D115-D117, D123)
 
 ### Added
@@ -62,6 +113,24 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Tests
 - A pin survives supersession of all its sources; unpinning restores demotion; pinned first; the card caps at 40 with the true total; sourceless pins stand only when human-written; add refused for a model, unpinned or unknown kind; update refuses bad kind or pin and a model moving its memory into `persona`; a refresh never replaces a pin; brief line prefix.
+
+## 2026-11-27 — Dialog store backup package (Mill Board #528, D78)
+
+### Added
+- Each backup also packages the dialog store, when the node has one, as `backups/<label>-<timestamp>.dialogs` (same label and timestamp as the engine backup): `dialogs.sqlite3` copied by `VACUUM INTO` and synced, the body blob of every row in that copy, and `manifest.jsonl` with each row's canonical hash (D77) and body hash. Built in `.dialogs.partial` and renamed. Only blobs the copy's rows name are copied, so orphan blobs from a crashed write are left out.
+- `dialog_backup::verify` checks a package (every row matches the manifest, every blob its full sha256, counts equal) and `dialog_backup::restore` puts a verified package back as a new store directory, refusing an existing one, and checks the result again. No CLI or MCP surface yet; the restore drill before the migration uses these.
+- `BackupOutcome.dialogs`: `written` (path and dialog count) or `failed` (error); left out of the output when there is no dialog store, so existing backups look the same. A failed package is logged and never fails the backup, because the engine copy is still the record in this phase (D82).
+- `DialogStore::scan` (all rows, oldest first) with a conformance check; `DialogRecord::canonical_hash`; `SqliteDialogs::open_read_only` and `snapshot_into`; `db::dialogs::dir_beside` (moved from the shadow write).
+
+### Changed
+- Dialog packages are pruned to `BACKUP_RETENTION_COUNT` on their own count; `pruned` and `total_backups` still count engine backups only. Pruning is best effort: it lists packages without reading inside them, and a listing failure is logged and reported as `dialog_prune_warning` without failing the backup.
+
+### Not in this change
+- The cloud upload covers the engine backup only. Uploading the dialog package is a follow-up.
+- Reconcile on open, the rebuild check (D77) and the migration of existing dialog rows (D3, dry run first).
+
+### Tests
+- Package round trip through restore with a shared body and an orphan blob; empty store; missing blob fails and leaves nothing; existing destination refused for create and restore; tampered blob fails verify and restore; dropped, altered and extra manifest lines fail verify; snapshot keeps the triggers; read-only handle refuses appends. Through `create_backup`: no store means no package and no output field; a written package shares the stem and verifies; a failed package is reported while the engine backup stands; packages prune to the retention count.
 
 ## 2026-11-26 — Entity overlap ranking signal measured and dropped (Mill Board #64, D92)
 
