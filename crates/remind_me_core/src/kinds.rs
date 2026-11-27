@@ -322,6 +322,12 @@ pub fn is_pinned(metadata: &Value) -> bool {
     metadata.get("pinned").and_then(Value::as_bool) == Some(true)
 }
 
+/// Whether a row is a pinned persona line, which consolidation never merges
+/// (pack D102). Unparseable metadata reads as unpinned.
+pub fn is_pinned_persona(category: &str, metadata: Option<&Value>) -> bool {
+    category == crate::models::PERSONA_CATEGORY && metadata.is_some_and(is_pinned)
+}
+
 /// Check a `persona` memory's `metadata.pinned` (a boolean) and
 /// `metadata.kind` (one of [`PersonaKind::ALL`]); both optional.
 pub fn validate_persona(metadata: &Value) -> Result<(), KindError> {
