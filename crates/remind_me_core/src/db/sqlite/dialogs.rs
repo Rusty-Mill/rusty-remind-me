@@ -6,10 +6,11 @@
 use super::sqlite_error;
 use crate::db::dialogs::{Appended, DialogRecord, DialogStore};
 use crate::db::{Result, StoreError};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use std::path::Path;
 
-const FILE: &str = "dialogs.sqlite3";
+/// The dialog file inside a store (or backup package) directory.
+pub const FILE: &str = "dialogs.sqlite3";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS dialogs (
@@ -56,6 +57,38 @@ impl SqliteDialogs {
     /// [`StoreError::Engine`] if the schema cannot be created.
     pub fn open_in_memory() -> Result<Self> {
         Self::with_schema(Connection::open_in_memory().map_err(sqlite_error)?)
+    }
+
+    /// Open an existing dialog file read-only: a backup package or a
+    /// restored copy being checked. Nothing is created or changed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Engine`] if the file is missing or not SQLite.
+    pub fn open_read_only(file: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(file, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(sqlite_error)?;
+        Ok(Self { conn })
+    }
+
+    /// Write a consistent copy of the store to `file` (`VACUUM INTO`, D78),
+    /// then sync it, since SQLite does not sync that output. The copy keeps
+    /// the triggers, so it is append-only too. `file` must not exist.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Invalid`] for a path that is not UTF-8, otherwise
+    /// [`StoreError::Engine`].
+    pub fn snapshot_into(&self, file: &Path) -> Result<()> {
+        let target = file
+            .to_str()
+            .ok_or_else(|| StoreError::Invalid(format!("{}: not UTF-8", file.display())))?;
+        self.conn
+            .execute("VACUUM INTO ?1", [target])
+            .map_err(sqlite_error)?;
+        std::fs::File::open(file)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| StoreError::Engine(format!("dialogs: {}: {e}", file.display())))
     }
 
     fn with_schema(conn: Connection) -> Result<Self> {
@@ -156,6 +189,19 @@ impl DialogStore for SqliteDialogs {
             .map(|n| n.try_into().unwrap_or(0))
             .map_err(sqlite_error)
     }
+
+    fn scan(&self, visit: &mut dyn FnMut(DialogRecord) -> Result<()>) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {COLUMNS} FROM dialogs ORDER BY created_at, id"
+            ))
+            .map_err(sqlite_error)?;
+        for row in stmt.query_map([], record).map_err(sqlite_error)? {
+            visit(row.map_err(sqlite_error)?)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -188,6 +234,35 @@ mod tests {
         assert!(upd.unwrap_err().to_string().contains("append-only"));
         assert!(del.unwrap_err().to_string().contains("append-only"));
         assert_eq!(s.get("d1").unwrap().unwrap().head, "hi");
+    }
+
+    #[test]
+    fn a_snapshot_holds_every_row_and_stays_append_only() {
+        let dir = scratch("snapshot");
+        let mut s = SqliteDialogs::open(&dir).unwrap();
+        let r = crate::db::dialogs::conformance::record("d1", "c1", "2026-11-25T00:00:00Z", "hi");
+        s.append(&r).unwrap();
+        let copy = dir.join("copy.sqlite3");
+        s.snapshot_into(&copy).unwrap();
+        let snap = SqliteDialogs::open_read_only(&copy).unwrap();
+        assert_eq!(snap.get("d1").unwrap(), Some(r));
+        // The triggers came along: a writable handle still cannot delete.
+        let rw = Connection::open(&copy).unwrap();
+        assert!(rw.execute("DELETE FROM dialogs", []).is_err());
+        // A second snapshot onto an existing file is refused.
+        assert!(s.snapshot_into(&copy).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_only_handle_refuses_appends_and_missing_files() {
+        let dir = scratch("readonly");
+        SqliteDialogs::open(&dir).unwrap();
+        let mut ro = SqliteDialogs::open_read_only(&dir.join(FILE)).unwrap();
+        let r = crate::db::dialogs::conformance::record("d1", "c1", "2026-11-25T00:00:00Z", "hi");
+        assert!(ro.append(&r).is_err());
+        assert!(SqliteDialogs::open_read_only(&dir.join("absent.sqlite3")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

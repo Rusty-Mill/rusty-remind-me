@@ -7,6 +7,12 @@
 //!
 //! Backups taken while the node stored in SQLite (`backups/*.db` files,
 //! before ADR-0025) still list and are pruned in turn.
+//!
+//! When the node has a dialog store (#528), each backup also writes its own
+//! package `backups/{label}-{timestamp}.dialogs` ([`crate::dialog_backup`],
+//! D78), with the same label and retention. In this phase the engine copy
+//! is the record, so a failed dialog package is reported in the outcome and
+//! never fails the backup. The cloud upload covers the engine copy only.
 
 use crate::db::Store;
 use chrono::Utc;
@@ -60,6 +66,33 @@ pub struct BackupOutcome {
     /// whoever asked for the backup instead of only appearing in a log.
     #[serde(skip_serializing_if = "is_not_configured")]
     pub upload: crate::cloud_backup::UploadOutcome,
+    /// What the dialog store's package did. `NoStore` (and left out of the
+    /// output) when the node has no dialog store.
+    #[serde(default, skip_serializing_if = "DialogPackage::is_no_store")]
+    pub dialogs: DialogPackage,
+}
+
+/// The dialog store's part of a backup run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DialogPackage {
+    /// The node has no dialog store, so there is nothing to package.
+    #[default]
+    NoStore,
+    Written {
+        path: String,
+        dialogs: u64,
+    },
+    /// The package could not be built; the engine backup still stands.
+    Failed {
+        error: String,
+    },
+}
+
+impl DialogPackage {
+    fn is_no_store(&self) -> bool {
+        matches!(self, Self::NoStore)
+    }
 }
 
 fn is_not_configured(outcome: &crate::cloud_backup::UploadOutcome) -> bool {
@@ -84,8 +117,23 @@ pub fn backup_dir(store: &Store<'_>) -> Result<PathBuf> {
     Ok(parent.join(BACKUP_DIR_NAME))
 }
 
-/// List existing backups, newest first.
+/// List existing backups of the engine, newest first.
 pub fn list_backups(dir: &Path) -> Result<Vec<BackupInfo>> {
+    list_where(dir, |path, extension| {
+        extension == Some("db") || (extension == Some(ENGINE_BACKUP_EXTENSION) && path.is_dir())
+    })
+}
+
+/// List existing dialog packages, newest first.
+pub fn list_dialog_packages(dir: &Path) -> Result<Vec<BackupInfo>> {
+    list_where(dir, |path, extension| {
+        extension == Some(crate::dialog_backup::EXTENSION) && path.is_dir()
+    })
+}
+
+/// Entries of `dir` that `keep` accepts (given the path and its extension),
+/// newest first. A directory's size is the bytes of every file under it.
+fn list_where(dir: &Path, keep: impl Fn(&Path, Option<&str>) -> bool) -> Result<Vec<BackupInfo>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -96,14 +144,12 @@ pub fn list_backups(dir: &Path) -> Result<Vec<BackupInfo>> {
     for entry in entries {
         let entry = entry.map_err(io(dir))?;
         let path = entry.path();
-        let extension = path.extension().and_then(|e| e.to_str());
-        let is_engine = extension == Some(ENGINE_BACKUP_EXTENSION) && path.is_dir();
-        if extension != Some("db") && !is_engine {
+        if !keep(&path, path.extension().and_then(|e| e.to_str())) {
             continue;
         }
         let metadata = entry.metadata().map_err(io(&path))?;
         let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-        let size_bytes = if is_engine {
+        let size_bytes = if path.is_dir() {
             size_of_tree(&path)?
         } else {
             metadata.len()
@@ -140,9 +186,9 @@ fn size_of_tree(dir: &Path) -> Result<u64> {
     Ok(total)
 }
 
-/// Delete backups beyond `keep`, oldest first. Returns how many were removed.
-fn prune_old_backups(dir: &Path, keep: usize) -> Result<usize> {
-    let backups = list_backups(dir)?;
+/// Delete the entries of `backups` (newest first) beyond `keep`. Returns how
+/// many were removed.
+fn prune_old_backups(backups: &[BackupInfo], keep: usize) -> usize {
     let mut removed = 0;
     for stale in backups.iter().skip(keep) {
         // A backup that vanished under us is not an error worth failing the
@@ -157,7 +203,32 @@ fn prune_old_backups(dir: &Path, keep: usize) -> Result<usize> {
             removed += 1;
         }
     }
-    Ok(removed)
+    removed
+}
+
+/// Package the dialog store beside `store`'s database as
+/// `{dir}/{stem}.dialogs`, if there is one. Never an error: a failure is
+/// logged and reported in the outcome (see the module docs).
+fn package_dialogs(store: &Store<'_>, dir: &Path, stem: &str) -> DialogPackage {
+    let Some(source) = store.path().and_then(crate::db::dialogs::dir_beside) else {
+        return DialogPackage::NoStore;
+    };
+    if !source.join(crate::db::sqlite::DIALOGS_FILE).is_file() {
+        return DialogPackage::NoStore;
+    }
+    let dest = dir.join(format!("{stem}.{}", crate::dialog_backup::EXTENSION));
+    match crate::dialog_backup::create(&source, &dest) {
+        Ok(dialogs) => DialogPackage::Written {
+            path: dest.to_string_lossy().to_string(),
+            dialogs,
+        },
+        Err(e) => {
+            eprintln!("rusty-remind-me: dialog backup package failed: {e}");
+            DialogPackage::Failed {
+                error: e.to_string(),
+            }
+        }
+    }
 }
 
 /// Back up the store into `backups/{label}-{timestamp}.engine` beside the
@@ -174,27 +245,29 @@ fn prune_old_backups(dir: &Path, keep: usize) -> Result<usize> {
 pub fn create_backup(store: &Store<'_>, label: &str) -> Result<BackupOutcome> {
     let dir = backup_dir(store)?;
     std::fs::create_dir_all(&dir).map_err(io(&dir))?;
-    let dest = dir.join(format!(
-        "{}-{}.{ENGINE_BACKUP_EXTENSION}",
-        safe_label(label),
-        timestamp()
-    ));
+    let stem = format!("{}-{}", safe_label(label), timestamp());
+    let dest = dir.join(format!("{stem}.{ENGINE_BACKUP_EXTENSION}"));
     let partial = dest.with_extension("partial");
     if partial.exists() {
         std::fs::remove_dir_all(&partial).map_err(io(&partial))?;
     }
     store.backend().lock()?.backup_to(&partial)?;
     std::fs::rename(&partial, &dest).map_err(io(&dest))?;
+    let dialogs = package_dialogs(store, &dir, &stem);
     // Strictly after the local backup is finished and on disk. A refused,
     // failed or unconfigured upload is reported alongside the backup, never
     // instead of it — the local copy is the one that has to survive.
     let upload = crate::cloud_backup::upload_backup_dir(&dest);
-    let pruned = prune_old_backups(&dir, BACKUP_RETENTION_COUNT)?;
+    let pruned = prune_old_backups(&list_backups(&dir)?, BACKUP_RETENTION_COUNT);
+    // Dialog packages are pruned on their own count, not reported as
+    // `pruned`, which keeps meaning engine backups.
+    prune_old_backups(&list_dialog_packages(&dir)?, BACKUP_RETENTION_COUNT);
     Ok(BackupOutcome {
         path: dest.to_string_lossy().to_string(),
         total_backups: list_backups(&dir)?.len(),
         pruned,
         upload,
+        dialogs,
     })
 }
 
