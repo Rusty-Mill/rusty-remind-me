@@ -232,10 +232,13 @@ fn statements(
     Ok(rows
         .into_iter()
         .map(|row| StatementRow {
+            // Not JSON reads as no metadata, so no pin, as `json_extract` would.
+            metadata: row.metadata_value().unwrap_or(serde_json::Value::Null),
             id: row.id,
             content: row.content,
             vitality: row.vitality,
             created_at: row.created_at,
+            written_by: row.written_by,
         })
         .collect())
 }
