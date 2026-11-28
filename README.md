@@ -761,7 +761,7 @@ surfaces):
 | `GET` | `/health` | Server health check — `{"status": "ok", "version": "0.1.0"}` |
 | `GET` | `/api/stats` | Dashboard-level memory statistics |
 | `GET` | `/api/memories` | List memories |
-| `POST` | `/api/memories` | Store a new memory (`MemoryAddInput` JSON body) |
+| `POST` | `/api/memories` | Store a new memory (`MemoryAddInput` JSON body). Optional `project` (blank is unset) and `memory_type` work as on `remind_me_add`; an invalid kind, or a `decision` without `metadata.rationale`, is a 400 |
 | `GET` | `/api/memories/{memory_id}` | Fetch one memory by ID, with its `version` |
 | `PUT`, `PATCH` | `/api/memories/{memory_id}` | Update a memory; optional `if_version` (see below) |
 | `DELETE` | `/api/memories/{memory_id}` | Delete a memory |

@@ -166,6 +166,99 @@ fn malformed_json_is_a_400() {
     std::fs::remove_dir_all(&root).unwrap();
 }
 
+fn post_add(server: &ApiServer, body: serde_json::Value) -> common::Response {
+    authed_json(server, "POST", "/api/memories", &body.to_string())
+}
+
+#[test]
+fn project_and_memory_type_are_stored() {
+    let (server, root) = authed_server("add-project-kind");
+    let response = post_add(
+        &server,
+        json!({ "content": "a lesson", "project": "bbp_factory", "memory_type": "learning" }),
+    );
+    assert_eq!(response.status, 201);
+    let id = response.json()["id"].as_str().unwrap().to_string();
+    let stored = authed_get(&server, &format!("/api/memories/{id}")).json();
+    assert_eq!(stored["project"], "bbp_factory");
+    assert_eq!(stored["memory_type"], "learning");
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn omitting_project_and_memory_type_behaves_as_before() {
+    let (server, root) = authed_server("add-no-project-kind");
+    let plain = post_add(&server, json!({ "content": "plain" })).json();
+    let nulls = post_add(
+        &server,
+        json!({ "content": "nulls", "project": null, "memory_type": null }),
+    )
+    .json();
+    assert_eq!(plain["memory_type"], nulls["memory_type"]);
+    assert_eq!(plain["project"], nulls["project"]);
+    assert_ne!(plain["memory_type"], "learning");
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_blank_project_is_unset() {
+    let (server, root) = authed_server("add-blank-project");
+    let plain = post_add(&server, json!({ "content": "plain" })).json();
+    let blank = post_add(&server, json!({ "content": "blank", "project": "  " })).json();
+    assert_eq!(blank["project"], plain["project"]);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn an_unknown_memory_type_is_a_400() {
+    let (server, root) = authed_server("add-bad-kind");
+    let response = post_add(&server, json!({ "content": "x", "memory_type": "rumour" }));
+    assert_eq!(response.status, 400);
+    assert!(response.json()["error"]
+        .as_str()
+        .unwrap()
+        .contains("rumour"));
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_decision_without_rationale_is_a_400() {
+    let (server, root) = authed_server("add-decision-no-why");
+    let refused = post_add(
+        &server,
+        json!({ "content": "x", "memory_type": "decision" }),
+    );
+    assert_eq!(refused.status, 400);
+    assert!(refused.json()["error"]
+        .as_str()
+        .unwrap()
+        .contains("rationale"));
+    let accepted = post_add(
+        &server,
+        json!({ "content": "x", "memory_type": "decision", "metadata": { "rationale": "why" } }),
+    );
+    assert_eq!(accepted.status, 201);
+    assert_eq!(accepted.json()["memory_type"], "decision");
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn non_string_project_or_memory_type_is_a_400() {
+    let (server, root) = authed_server("add-non-string");
+    for body in [
+        json!({ "content": "x", "project": 7 }),
+        json!({ "content": "x", "memory_type": ["fact"] }),
+    ] {
+        let response = post_add(&server, body);
+        assert_eq!(response.status, 400);
+        assert!(response.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("must be a string"));
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/memories/{id}
 // ---------------------------------------------------------------------------
