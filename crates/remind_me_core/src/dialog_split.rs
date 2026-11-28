@@ -21,7 +21,7 @@ use crate::db::{Result, Store, StoreError};
 use crate::dialog_reconcile::{group_key, mint_group, MintKey, MINTED_PREFIX};
 use crate::importer::{extract_messages_with_tools, filter_messages};
 use crate::models::Memory;
-use crate::redact::REDACTED_PREFIX;
+use crate::redact::{redact, REDACTED_PREFIX};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -251,49 +251,90 @@ fn haystacks(conversation: &serde_json::Value) -> Vec<String> {
 /// Whether `output` holds `content`. A redaction marker stands for text the
 /// raw output still has: the importer redacts each chunk after cutting, so
 /// a secret across a cut leaves a marker no whole-message redaction makes.
-/// The literal text around the markers must then appear, in order. Matching
-/// never runs redaction, so `REMIND_ME_REDACT` cannot move the ids.
+/// The literal text around the markers must then appear in order, and the
+/// source text between two literals must itself redact to those markers'
+/// kinds. A marker at either edge of the row has no neighbour to bound it,
+/// since the cut may have split its secret, and is not checked. Matching
+/// runs only the pure redaction rules, never the env switch, so
+/// `REMIND_ME_REDACT` cannot move the ids.
 fn holds(output: &str, content: &str) -> bool {
     if !content.contains(REDACTED_PREFIX) {
         return output.contains(content);
     }
-    let literals = literals(content);
-    if literals.iter().all(|l| l.is_empty()) {
+    let pieces = pieces(content);
+    let literals: Vec<usize> = (0..pieces.len())
+        .filter(|&i| !pieces[i].text.is_empty())
+        .collect();
+    let Some(&first) = literals.first() else {
         return false;
+    };
+    output
+        .match_indices(pieces[first].text)
+        .any(|(at, l)| follows(output, at + l.len(), &pieces, &literals[1..], first))
+}
+
+/// Whether the literals in `rest` can be placed after byte `from` of
+/// `output`, each gap redacting to the kinds of the markers it replaced.
+fn follows(output: &str, from: usize, pieces: &[Piece<'_>], rest: &[usize], prev: usize) -> bool {
+    let Some((&next, tail)) = rest.split_first() else {
+        return true;
+    };
+    let kinds: Vec<&str> = pieces[prev + 1..=next]
+        .iter()
+        .flat_map(|p| p.kinds_before.iter().copied())
+        .collect();
+    output[from..]
+        .match_indices(pieces[next].text)
+        .map(|(at, l)| (from + at, l.len()))
+        .any(|(at, len)| {
+            redacts_to(&output[from..at], &kinds) && follows(output, at + len, pieces, tail, next)
+        })
+}
+
+/// Whether `gap` holds a secret of every kind in `kinds`.
+fn redacts_to(gap: &str, kinds: &[&str]) -> bool {
+    if kinds.is_empty() {
+        return gap.is_empty();
     }
-    let mut from = 0;
-    for literal in literals.iter().filter(|l| !l.is_empty()) {
-        let Some(at) = output[from..].find(literal) else {
-            return false;
-        };
-        from += at + literal.len();
-    }
-    true
+    let redacted = redact(gap).content;
+    kinds
+        .iter()
+        .all(|k| redacted.contains(&format!("{REDACTED_PREFIX}{k}]")))
+}
+
+/// A run of literal text and the kinds of the markers just before it.
+struct Piece<'a> {
+    kinds_before: Vec<&'a str>,
+    text: &'a str,
 }
 
 /// `content` cut at each `[REDACTED:<kind>]` marker.
-fn literals(content: &str) -> Vec<&str> {
+fn pieces(content: &str) -> Vec<Piece<'_>> {
     let mut out = Vec::new();
+    let mut kinds = Vec::new();
     let mut rest = content;
     while let Some(start) = rest.find(REDACTED_PREFIX) {
-        out.push(&rest[..start]);
         let tail = &rest[start + REDACTED_PREFIX.len()..];
         let Some(end) = tail.find(']') else {
-            // An unclosed marker is literal text.
-            out.pop();
-            out.push(rest);
-            return out;
+            break; // An unclosed marker is literal text.
         };
+        out.push(Piece {
+            kinds_before: std::mem::take(&mut kinds),
+            text: &rest[..start],
+        });
+        kinds.push(&tail[..end]);
         rest = &tail[end + 1..];
     }
-    out.push(rest);
+    out.push(Piece {
+        kinds_before: kinds,
+        text: rest,
+    });
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::redact::redact;
 
     fn row(id: &str, content: &str) -> Memory {
         let new = crate::db::memories::NewMemory {
@@ -475,9 +516,14 @@ mod tests {
 
     #[test]
     fn literals_around_markers_must_appear_in_order() {
-        assert!(holds("one two three", "one [REDACTED:x] three"));
-        assert!(!holds("three two one", "one [REDACTED:x] three"));
-        assert!(!holds("anything", "[REDACTED:x]"));
+        let card = "card [REDACTED:card_number] please";
+        assert!(holds("card 4111 1111 1111 1111 please", card));
+        assert!(
+            !holds("card is not needed please", card),
+            "the gap must redact"
+        );
+        assert!(!holds("please card 4111 1111 1111 1111", card));
+        assert!(!holds("anything", "[REDACTED:card_number]"));
         assert!(holds("a [REDACTED:open", "a [REDACTED:open"));
     }
 }
