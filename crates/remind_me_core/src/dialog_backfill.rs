@@ -4,8 +4,9 @@
 //! and reports what it would do, writing nothing: no store, file, blob or
 //! row is created. The apply waits for Nano's go on these counts (D3).
 //!
-//! A row with no `capture_id` cannot be stored and is listed, not a
-//! finding (Q38). A store row whose id has a different canonical hash
+//! A row with no `capture_id` moves under a generated one, one per
+//! conversation (D147, D148); the report counts them by grouping key. A
+//! store row whose id has a different canonical hash
 //! (D77) is drift: the apply would refuse it. The two digests let the
 //! later apply prove it reached exactly the store Nano approved.
 
@@ -14,10 +15,12 @@ use crate::db::dialogs::DialogStore;
 use crate::db::memories::Memories;
 use crate::db::sqlite::SqliteDialogs;
 use crate::db::{Result, Store};
-use crate::dialog_reconcile::{as_record, blob_state, store_file, Blob, Depth};
+use crate::dialog_reconcile::{
+    as_record, blob_state, mint_group, minted_capture_id, store_file, Blob, Depth,
+};
 use crate::models::{Memory, DIALOG_CATEGORY};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// What a backfill would do. Lists hold dialog ids.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,8 +36,13 @@ pub struct Report {
     pub already_present: u64,
     /// Rows the store holds under the same id with a different hash.
     pub drift: Vec<String>,
-    /// Rows with no `capture_id`: they cannot be stored (Q38).
-    pub no_capture_id: Vec<String>,
+    /// Rows with no `capture_id`, which move under a generated one (D147),
+    /// and how many distinct generated ids they make.
+    pub minted_rows: u64,
+    pub minted_capture_ids: u64,
+    /// The same, by grouping key (`session`, `doc`, `import`, `row`): `row`
+    /// counts rows that fell back to an id of their own (D148).
+    pub minted_by_key: BTreeMap<String, MintCount>,
     /// Store rows whose blob is missing or the wrong size.
     pub blob_missing: Vec<String>,
     pub blob_mismatch: Vec<String>,
@@ -49,9 +57,17 @@ pub struct Report {
     pub target_digest: String,
 }
 
+/// Generated capture ids under one grouping key.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MintCount {
+    /// Distinct generated ids.
+    pub groups: u64,
+    pub rows: u64,
+}
+
 impl Report {
-    /// Problems that would stop the apply; rows to append and rows with
-    /// no capture id are not.
+    /// Problems that would stop the apply; rows to append and rows with a
+    /// generated capture id are not.
     pub fn findings(&self) -> usize {
         self.drift.len() + self.blob_missing.len() + self.blob_mismatch.len() + self.no_memory.len()
     }
@@ -70,14 +86,9 @@ pub fn plan(store: &Store<'_>) -> Result<Report> {
         sensitive: rows.iter().filter(|m| m.sensitive).count() as u64,
         ..Report::default()
     };
-    let mut movable: HashMap<String, Memory> = HashMap::new();
-    for m in rows {
-        if m.capture_id.is_none() {
-            report.no_capture_id.push(m.id);
-        } else {
-            movable.insert(m.id.clone(), m);
-        }
-    }
+    count_minted(&rows, &mut report);
+    let mut movable: HashMap<String, Memory> =
+        rows.into_iter().map(|m| (m.id.clone(), m)).collect();
     let mut stored = compare_store(store, &memories, &mut movable, &mut report)?;
     report.store_rows = stored.len() as u64;
     report.store_digest = digest(&stored);
@@ -89,6 +100,31 @@ pub fn plan(store: &Store<'_>) -> Result<Report> {
     report.target_rows = stored.len() as u64;
     report.target_digest = digest(&stored);
     Ok(report)
+}
+
+/// Count the rows that would take a generated capture id, overall and by
+/// grouping key.
+fn count_minted(rows: &[Memory], report: &mut Report) {
+    let mut ids: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
+    for m in rows {
+        let Some(id) = minted_capture_id(m) else {
+            continue;
+        };
+        let key = mint_group(m).0.as_str();
+        report.minted_rows += 1;
+        report
+            .minted_by_key
+            .entry(key.to_string())
+            .or_default()
+            .rows += 1;
+        ids.entry(key).or_default().insert(id);
+    }
+    for (key, set) in &ids {
+        if let Some(count) = report.minted_by_key.get_mut(*key) {
+            count.groups = set.len() as u64;
+        }
+    }
+    report.minted_capture_ids = ids.values().map(|s| s.len() as u64).sum();
 }
 
 /// Scan the store, if there is one, against `movable`, removing every id it

@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-28 — Dialog backfill dry run: generated capture ids (Mill Board #528, D146–D149)
+
+### Changed
+- `dialog_backfill::plan` no longer leaves out dialog rows that have no `capture_id`. Nano chose one id per conversation (Q38, D147), so each such row now moves under a generated capture id (D148): its group key is the first of `session:<source>:<session_id>`, `doc:<doc_id>`, `import:<metadata.import_id>` and `row:<id>`, and the id is `cap_gen_` plus the first 32 hex digits of the key's sha256. Rows of one conversation share one id, and the same rows always get the same id, so the target digest binds them.
+- **Compatibility:** the report drops `no_capture_id` and adds `minted_rows`, `minted_capture_ids` and `minted_by_key` (per key kind: `groups`, `rows`). These rows now count in `would_append` and in `target_digest`.
+- `docs/handoff`: D146 (the store sits beside the configured database path, so `~/.remind-me/memory.db.dialogs/` on the host is correct), D147 (Nano: one id per conversation), D148 (the rule above), D149 (Nano: turn the shadow write on now). Q38 is closed and Q40 answered.
+
+### Tests
+- Five old rows with no capture id (two in one session, one from a document, one from an import, one alone) all would append under four generated ids, counted per key kind. A captured row takes no generated id. Appending the rows under their generated ids reaches exactly the planned target digest.
+
 ## 2026-11-27 — Dialog backfill dry run (Mill Board #528, D144, D145)
 
 ### Added

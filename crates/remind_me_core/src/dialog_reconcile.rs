@@ -77,12 +77,17 @@ pub(crate) fn store_file(store: &Store<'_>) -> Option<PathBuf> {
 }
 
 /// The row a `memories` dialog row would be in the store: what the shadow
-/// write appends (`dialog_shadow::record_memory`). The head is not part of
-/// the canonical hash, so it is left empty.
+/// write appends (`dialog_shadow::record_memory`). A row with no
+/// `capture_id` takes its generated one (D148). The head is not part of the
+/// canonical hash, so it is left empty.
 pub(crate) fn as_record(m: &Memory) -> DialogRecord {
     DialogRecord {
         id: m.id.clone(),
-        capture_id: m.capture_id.clone().unwrap_or_default(),
+        capture_id: m
+            .capture_id
+            .clone()
+            .or_else(|| minted_capture_id(m))
+            .unwrap_or_default(),
         session_id: m.session_id.clone(),
         project: m.project.clone(),
         created_at: m.created_at.clone(),
@@ -90,6 +95,68 @@ pub(crate) fn as_record(m: &Memory) -> DialogRecord {
         body_hash: content_key(m.content.as_bytes()),
         body_bytes: m.content.len() as u64,
     }
+}
+
+/// What a generated `capture_id` groups a row by (D148), in priority order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MintKey {
+    /// The capture source and its session id: one id per session.
+    Session,
+    /// The imported document: one id per import file.
+    Doc,
+    /// The import recorded in metadata.
+    Import,
+    /// Nothing to group by: one id for the row alone.
+    Row,
+}
+
+impl MintKey {
+    /// The key's name in reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Doc => "doc",
+            Self::Import => "import",
+            Self::Row => "row",
+        }
+    }
+}
+
+/// Prefix of a generated `capture_id`. Real ids are `cap_` and 32 hex
+/// digits, so `gen_` cannot collide, and marks the id as generated.
+pub const MINTED_PREFIX: &str = "cap_gen_";
+
+/// The group a row with no `capture_id` falls in, and its key string.
+pub(crate) fn mint_group(m: &Memory) -> (MintKey, String) {
+    let present = |v: &Option<String>| v.as_deref().filter(|s| !s.is_empty()).map(str::to_owned);
+    if let Some(session) = present(&m.session_id) {
+        return (MintKey::Session, format!("session:{}:{session}", m.source));
+    }
+    if let Some(doc) = present(&m.doc_id) {
+        return (MintKey::Doc, format!("doc:{doc}"));
+    }
+    let import = m
+        .metadata
+        .get("import_id")
+        .and_then(serde_json::Value::as_str);
+    if let Some(import) = import.filter(|s| !s.is_empty()) {
+        return (MintKey::Import, format!("import:{import}"));
+    }
+    (MintKey::Row, format!("row:{}", m.id))
+}
+
+/// The generated `capture_id` of a row that has none (D147, D148): the same
+/// on every run, so the dry run's target digest binds the apply. `None`
+/// when the row has its own.
+pub(crate) fn minted_capture_id(m: &Memory) -> Option<String> {
+    if m.capture_id.is_some() {
+        return None;
+    }
+    let (_, key) = mint_group(m);
+    Some(format!(
+        "{MINTED_PREFIX}{}",
+        &content_key(key.as_bytes())[..32]
+    ))
 }
 
 /// The state of a row's blob.

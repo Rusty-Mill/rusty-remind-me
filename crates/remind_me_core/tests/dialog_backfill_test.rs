@@ -4,7 +4,7 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
-use remind_me_core::blobs::BlobStore;
+use remind_me_core::blobs::{content_key, BlobStore};
 use remind_me_core::capture::auto_capture;
 use remind_me_core::db::dialogs::{dir_beside, DialogLog, DialogStore, NewDialog};
 use remind_me_core::db::memories::{Memories, NewMemory};
@@ -170,22 +170,131 @@ fn drift_orphans_and_bad_blobs_are_findings() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Five old dialog rows with no capture id: two from one session, one
+/// from an imported document, one from an import recorded in metadata,
+/// one with nothing to group by.
+fn old_imports(db: &Database) -> Vec<String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let row = |id: &str| NewMemory {
+        category: "dialog".into(),
+        source: "import".into(),
+        ..NewMemory::new(id, format!("user: {id}"), &now)
+    };
+    let rows = [
+        NewMemory {
+            session_id: Some("s1".into()),
+            ..row("mem_s1a")
+        },
+        NewMemory {
+            session_id: Some("s1".into()),
+            ..row("mem_s1b")
+        },
+        NewMemory {
+            doc_id: Some("doc1".into()),
+            ..row("mem_doc")
+        },
+        NewMemory {
+            metadata: serde_json::json!({ "import_id": "imp1" }),
+            ..row("mem_imp")
+        },
+        row("mem_lone"),
+    ];
+    let db_store = db.store();
+    let memories = Memories::new(&db_store);
+    for r in &rows {
+        memories.insert(r).unwrap();
+    }
+    rows.iter().map(|r| r.id.clone()).collect()
+}
+
+/// The generated id of a group key (D148).
+fn generated(key: &str) -> String {
+    format!("cap_gen_{}", &content_key(key.as_bytes())[..32])
+}
+
 #[test]
-fn a_dialog_with_no_capture_id_is_listed_not_a_finding() {
+fn rows_with_no_capture_id_move_under_one_generated_id_per_conversation() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (dir, db) = fresh("nocap");
-    let now = chrono::Utc::now().to_rfc3339();
-    let row = NewMemory {
-        category: "dialog".into(),
-        ..NewMemory::new("mem_imported", "user: an old import", &now)
-    };
-    Memories::new(&db.store()).insert(&row).unwrap();
+    old_imports(&db);
 
     let report = plan(&db.store()).unwrap();
 
-    assert_eq!(report.no_capture_id, ["mem_imported"]);
-    assert_eq!(report.would_append, 0);
-    assert_eq!(report.findings(), 0);
+    assert_eq!((report.live, report.would_append), (5, 5));
+    assert_eq!((report.minted_rows, report.minted_capture_ids), (5, 4));
+    let by_key: Vec<(&str, u64, u64)> = report
+        .minted_by_key
+        .iter()
+        .map(|(k, c)| (k.as_str(), c.groups, c.rows))
+        .collect();
+    assert_eq!(
+        by_key,
+        [
+            ("doc", 1, 1),
+            ("import", 1, 1),
+            ("row", 1, 1),
+            ("session", 1, 2)
+        ]
+    );
+    assert_eq!(report.findings(), 0, "{report:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_captured_row_takes_no_generated_id() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, db) = fresh("captured");
+    capture(&db, "alpha", false);
+
+    let report = plan(&db.store()).unwrap();
+
+    assert_eq!((report.would_append, report.minted_rows), (1, 0));
+    assert!(report.minted_by_key.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn generated_ids_are_stable_and_bind_the_target_digest() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, db) = fresh("minted_digest");
+    let ids = old_imports(&db);
+    let planned = plan(&db.store()).unwrap();
+
+    // What an apply does: each row under its generated id.
+    let keys = [
+        "session:import:s1",
+        "session:import:s1",
+        "doc:doc1",
+        "import:imp1",
+        "row:mem_lone",
+    ];
+    let store = store_dir(&dir);
+    let mut log = DialogLog::new(
+        SqliteDialogs::open(&store).unwrap(),
+        BlobStore::new(store.join("blobs")),
+    );
+    {
+        // The database lock is held until the block ends; `plan` takes it.
+        let db_store = db.store();
+        let memories = Memories::new(&db_store);
+        for (id, key) in ids.iter().zip(keys) {
+            let m = memories.get_live(id).unwrap().unwrap();
+            log.record(&NewDialog {
+                id: &m.id,
+                capture_id: &generated(key),
+                session_id: m.session_id.as_deref(),
+                project: m.project.as_deref(),
+                created_at: &m.created_at,
+                body: &m.content,
+            })
+            .unwrap();
+        }
+    }
+
+    let after = plan(&db.store()).unwrap();
+    assert_eq!((after.would_append, after.already_present), (0, 5));
+    assert_eq!(after.findings(), 0, "{after:?}");
+    assert_eq!(after.store_digest, planned.target_digest);
     let _ = std::fs::remove_dir_all(dir);
 }
 
