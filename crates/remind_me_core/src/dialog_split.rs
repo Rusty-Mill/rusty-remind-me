@@ -21,7 +21,7 @@ use crate::db::{Result, Store, StoreError};
 use crate::dialog_reconcile::{group_key, mint_group, MintKey, MINTED_PREFIX};
 use crate::importer::{extract_messages_with_tools, filter_messages};
 use crate::models::Memory;
-use crate::redact::redact;
+use crate::redact::REDACTED_PREFIX;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -179,7 +179,7 @@ pub(crate) fn split_file(import_id: &str, bytes: Option<&[u8]>, rows: &[&Memory]
         let mut found = texts
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.iter().any(|h| h.contains(m.content.as_str())));
+            .filter(|(_, t)| t.iter().any(|h| holds(h, &m.content)));
         match (found.next(), found.next()) {
             (Some((i, _)), None) => assigned.push((m.id.clone(), ids[i].clone())),
             (None, _) => unmatched += 1,
@@ -236,26 +236,64 @@ fn conversation_ids(import_id: &str, conversations: &[serde_json::Value]) -> Vec
         .collect()
 }
 
-/// Each string the importer could have cut a conversation's rows from, raw
-/// and redacted: every message in each mode, and the whole exchange as one
-/// candidate. Kept apart, as the importer chunks each one on its own, so a
-/// match can never span two of them.
+/// Each string the importer could have cut a conversation's rows from:
+/// every message in each mode, and the whole exchange as one candidate.
+/// Kept apart, as the importer chunks each one on its own, so a match can
+/// never span two of them.
 fn haystacks(conversation: &serde_json::Value) -> Vec<String> {
     let messages = extract_messages_with_tools(conversation);
-    let raw: Vec<String> = ["all_messages", "conversations", ""]
+    ["all_messages", "conversations", ""]
         .iter()
         .flat_map(|mode| filter_messages(&messages, mode))
-        .collect();
-    // Always redacted, whatever `REMIND_ME_REDACT` says now: the import may
-    // have run with it on, and the target digest must not move with the
-    // environment.
-    let redacted: Vec<String> = raw.iter().map(|r| redact(r).content).collect();
-    raw.into_iter().chain(redacted).collect()
+        .collect()
+}
+
+/// Whether `output` holds `content`. A redaction marker stands for text the
+/// raw output still has: the importer redacts each chunk after cutting, so
+/// a secret across a cut leaves a marker no whole-message redaction makes.
+/// The literal text around the markers must then appear, in order. Matching
+/// never runs redaction, so `REMIND_ME_REDACT` cannot move the ids.
+fn holds(output: &str, content: &str) -> bool {
+    if !content.contains(REDACTED_PREFIX) {
+        return output.contains(content);
+    }
+    let literals = literals(content);
+    if literals.iter().all(|l| l.is_empty()) {
+        return false;
+    }
+    let mut from = 0;
+    for literal in literals.iter().filter(|l| !l.is_empty()) {
+        let Some(at) = output[from..].find(literal) else {
+            return false;
+        };
+        from += at + literal.len();
+    }
+    true
+}
+
+/// `content` cut at each `[REDACTED:<kind>]` marker.
+fn literals(content: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find(REDACTED_PREFIX) {
+        out.push(&rest[..start]);
+        let tail = &rest[start + REDACTED_PREFIX.len()..];
+        let Some(end) = tail.find(']') else {
+            // An unclosed marker is literal text.
+            out.pop();
+            out.push(rest);
+            return out;
+        };
+        rest = &tail[end + 1..];
+    }
+    out.push(rest);
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redact::redact;
 
     fn row(id: &str, content: &str) -> Memory {
         let new = crate::db::memories::NewMemory {
@@ -413,5 +451,33 @@ mod tests {
         let outcome = split_file("imp1", Some(&bytes), &refs);
 
         assert_eq!(outcome, FileOutcome::Fallback(Fallback::ParseMismatch));
+    }
+
+    #[test]
+    fn a_secret_cut_across_chunks_still_places_its_row() {
+        // The importer cut inside the key, then redacted each chunk: the
+        // second chunk keeps the key's tail and a redacted card, which no
+        // whole-message redaction produces.
+        let key_tail = "aB3".repeat(40);
+        let message = format!("sk-{key_tail} card 4111 1111 1111 1111 please");
+        let chunk = redact(&format!("{key_tail} card 4111 1111 1111 1111 please")).content;
+        assert!(chunk.contains(REDACTED_PREFIX));
+        assert!(!redact(&message).content.contains(&chunk));
+        let bytes = export(serde_json::json!([
+            { "uuid": "u1", "chat_messages": [{ "sender": "human", "text": message }] },
+            { "uuid": "u2", "chat_messages": [{ "sender": "human", "text": "other" }] },
+        ]));
+        let rows = [row("m1", &chunk)];
+        let refs: Vec<&Memory> = rows.iter().collect();
+
+        assert_eq!(assigned(&split_file("imp1", Some(&bytes), &refs)).len(), 1);
+    }
+
+    #[test]
+    fn literals_around_markers_must_appear_in_order() {
+        assert!(holds("one two three", "one [REDACTED:x] three"));
+        assert!(!holds("three two one", "one [REDACTED:x] three"));
+        assert!(!holds("anything", "[REDACTED:x]"));
+        assert!(holds("a [REDACTED:open", "a [REDACTED:open"));
     }
 }
