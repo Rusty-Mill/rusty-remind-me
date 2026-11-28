@@ -38,6 +38,7 @@ pub mod dialog_backup;
 pub mod dialog_rebuild;
 pub mod dialog_reconcile;
 pub mod dialog_shadow;
+pub mod dialog_split;
 pub mod digest;
 pub mod duplicates;
 pub mod embedder;

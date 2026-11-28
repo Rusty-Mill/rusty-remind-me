@@ -5,12 +5,15 @@
 //! row is created. The apply waits for Nano's go on these counts (D3).
 //!
 //! A row with no `capture_id` moves under a generated one, one per
-//! conversation (D147, D148); the report counts them by grouping key. A
+//! conversation (D147, D148, D150); rows from an imported chat export are
+//! split by the conversation that holds them (D151, D152, `dialog_split`).
+//! The report counts them by grouping key. A
 //! store row whose id has a different canonical hash
 //! (D77) is drift: the apply would refuse it. The two digests let the
 //! later apply prove it reached exactly the store Nano approved.
 
 use crate::blobs::{content_key, BlobStore};
+use crate::db::dialogs::DialogRecord;
 use crate::db::dialogs::DialogStore;
 use crate::db::memories::Memories;
 use crate::db::sqlite::SqliteDialogs;
@@ -18,6 +21,7 @@ use crate::db::{Result, Store};
 use crate::dialog_reconcile::{
     as_record, blob_state, mint_group, minted_capture_id, store_file, Blob, Depth,
 };
+use crate::dialog_split::{resolve, FallbackCount, Residual, SplitCount, Splits};
 use crate::models::{Memory, DIALOG_CATEGORY};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -40,9 +44,17 @@ pub struct Report {
     /// and how many distinct generated ids they make.
     pub minted_rows: u64,
     pub minted_capture_ids: u64,
-    /// The same, by grouping key (`session`, `doc`, `import`, `row`): `row`
-    /// counts rows that fell back to an id of their own (D148).
+    /// The same, by grouping key (`session`, `conversation`, `doc`,
+    /// `import`, `row`): `row` counts rows that fell back to an id of their
+    /// own (D148), `conversation` rows split out of a chat export (D152).
     pub minted_by_key: BTreeMap<String, MintCount>,
+    /// Imported files split by conversation (D152).
+    pub conversation_split: SplitCount,
+    /// Imported files that kept one id, by reason (`no_archive`,
+    /// `not_a_conversation_list`, `parse_mismatch`).
+    pub conversation_fallback: BTreeMap<String, FallbackCount>,
+    /// Rows of split files that kept the file's id.
+    pub residual_rows: Residual,
     /// Store rows whose blob is missing or the wrong size.
     pub blob_missing: Vec<String>,
     pub blob_mismatch: Vec<String>,
@@ -86,31 +98,46 @@ pub fn plan(store: &Store<'_>) -> Result<Report> {
         sensitive: rows.iter().filter(|m| m.sensitive).count() as u64,
         ..Report::default()
     };
-    count_minted(&rows, &mut report);
+    let splits = resolve(store, &rows)?;
+    count_minted(&rows, &splits, &mut report);
+    report.conversation_split = splits.split.clone();
+    report.conversation_fallback = splits.fallback.clone();
+    report.residual_rows = splits.residual.clone();
     let mut movable: HashMap<String, Memory> =
         rows.into_iter().map(|m| (m.id.clone(), m)).collect();
-    let mut stored = compare_store(store, &memories, &mut movable, &mut report)?;
+    let mut stored = compare_store(store, &memories, &splits, &mut movable, &mut report)?;
     report.store_rows = stored.len() as u64;
     report.store_digest = digest(&stored);
     for m in movable.values() {
         report.would_append += 1;
         report.would_append_bytes += m.content.len() as u64;
-        stored.push(as_record(m).canonical_hash());
+        stored.push(record(m, &splits).canonical_hash());
     }
     report.target_rows = stored.len() as u64;
     report.target_digest = digest(&stored);
     Ok(report)
 }
 
+/// The store row `m` would become: its D150 record, with the conversation's
+/// id when its file was split.
+fn record(m: &Memory, splits: &Splits) -> DialogRecord {
+    let mut r = as_record(m);
+    if let Some(id) = splits.ids.get(&m.id) {
+        r.capture_id.clone_from(id);
+    }
+    r
+}
+
 /// Count the rows that would take a generated capture id, overall and by
 /// grouping key.
-fn count_minted(rows: &[Memory], report: &mut Report) {
+fn count_minted(rows: &[Memory], splits: &Splits, report: &mut Report) {
     let mut ids: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
     for m in rows {
-        let Some(id) = minted_capture_id(m) else {
-            continue;
+        let (key, id) = match (splits.ids.get(&m.id), minted_capture_id(m)) {
+            (Some(id), _) => ("conversation", id.clone()),
+            (None, Some(id)) => (mint_group(m).0.as_str(), id),
+            (None, None) => continue,
         };
-        let key = mint_group(m).0.as_str();
         report.minted_rows += 1;
         report
             .minted_by_key
@@ -132,6 +159,7 @@ fn count_minted(rows: &[Memory], report: &mut Report) {
 fn compare_store(
     store: &Store<'_>,
     memories: &Memories<'_>,
+    splits: &Splits,
     movable: &mut HashMap<String, Memory>,
     report: &mut Report,
 ) -> Result<Vec<String>> {
@@ -158,7 +186,7 @@ fn compare_store(
         };
         match live {
             None => report.no_memory.push(r.id),
-            Some(m) if as_record(&m).canonical_hash() == hash => report.already_present += 1,
+            Some(m) if record(&m, splits).canonical_hash() == hash => report.already_present += 1,
             Some(_) => report.drift.push(r.id),
         }
         hashes.push(hash);
