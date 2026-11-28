@@ -11,7 +11,7 @@ Dated entries, newest first. One entry per merged pull request.
 - Still read only. The apply is not built and waits for Nano's go after the new counts (D144, D3). Making `dialogs check` and the rebuild check use a stored `cap_gen_` id comes with the apply, because no backfilled row exists before it (D152 (5)).
 
 ### Tests
-- Unit: rows go to the conversation that holds them, two conversations get two ids, the uuid or position keys the id, unmatched and ambiguous rows keep the file id, and each fallback reason is reported.
+- Unit: rows go to the conversation that holds them, two conversations get two ids, the uuid or position keys the id, unmatched and ambiguous rows keep the file id, each fallback reason is reported, and a row redacted at import still matches with `REMIND_ME_REDACT=0` now (the redacted text is always built, so the ids and digest never depend on the environment).
 - Integration: an archived two-conversation export splits into 2 ids for 3 rows, a stray row keeps the file id, and the digest is stable across runs. The same rows with no archive keep one id under `no_archive`.
 
 ## 2026-11-28 — Dialog backfill dry run: generated capture ids (Mill Board #528, D146–D150)

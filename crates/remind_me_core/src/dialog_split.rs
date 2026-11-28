@@ -17,11 +17,11 @@
 
 use crate::archive::archived_bytes;
 use crate::blobs::content_key;
-use crate::boundary::scrub;
 use crate::db::{Result, Store, StoreError};
 use crate::dialog_reconcile::{group_key, mint_group, MintKey, MINTED_PREFIX};
 use crate::importer::{extract_messages_with_tools, filter_messages};
 use crate::models::Memory;
+use crate::redact::redact;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -239,8 +239,11 @@ fn haystacks(conversation: &serde_json::Value) -> [String; 2] {
     parts.extend(filter_messages(&messages, "conversations"));
     parts.extend(filter_messages(&messages, ""));
     let raw = parts.join("\n\n");
-    let scrubbed = scrub(&raw, &mut Vec::new(), &mut serde_json::json!({}));
-    [raw, scrubbed]
+    // Always redacted, whatever `REMIND_ME_REDACT` says now: the import may
+    // have run with it on, and the target digest must not move with the
+    // environment.
+    let redacted = redact(&raw).content;
+    [raw, redacted]
 }
 
 #[cfg(test)]
@@ -363,5 +366,26 @@ mod tests {
             split_file("imp1", Some(&two_chats(true)), &stray),
             FileOutcome::Fallback(Fallback::ParseMismatch)
         );
+    }
+
+    #[test]
+    fn a_row_redacted_at_import_matches_even_with_redaction_off_now() {
+        let secret = "card 4111 1111 1111 1111 please";
+        let bytes = export(serde_json::json!([
+            { "uuid": "u1", "chat_messages": [{ "sender": "human", "text": secret }] },
+            { "uuid": "u2", "chat_messages": [{ "sender": "human", "text": "other" }] },
+        ]));
+        let stored = redact(secret).content;
+        assert_ne!(stored, secret, "the fixture must hold a secret");
+        let rows = [row("m1", &stored)];
+        let refs: Vec<&Memory> = rows.iter().collect();
+
+        crate::test_env::set_var("REMIND_ME_REDACT", "0");
+        let off = split_file("imp1", Some(&bytes), &refs);
+        crate::test_env::remove_var("REMIND_ME_REDACT");
+        let on = split_file("imp1", Some(&bytes), &refs);
+
+        assert_eq!(assigned(&off).len(), 1);
+        assert_eq!(off, on, "the environment does not change the ids");
     }
 }
