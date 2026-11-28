@@ -14,6 +14,7 @@ use remind_me_core::db::queries;
 use remind_me_core::db::{Store, StoreError};
 use remind_me_core::entity::{entity_profile, list_entities, traverse_from_name};
 use remind_me_core::import_paths::{self, ImportPathError};
+use remind_me_core::kinds::StructuredFields;
 use remind_me_core::status::SubsystemStatus;
 use remind_me_core::webhook::constant_time_eq;
 use remind_me_core::wiki_fs::{pending_compile_count, Wiki};
@@ -332,7 +333,10 @@ pub fn api_list(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params
     }
 }
 
-/// `queries::add_memory`, reused verbatim.
+/// `queries::add_memory_with`, reused verbatim. Optional `project` and
+/// `memory_type` behave as on MCP `remind_me_add`: a blank project is unset,
+/// and the kind is validated by the same core check (card #1632). A refused
+/// write is a 400.
 pub fn api_add(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
     let body = match json_body(req) {
         Ok(b) => b,
@@ -344,6 +348,17 @@ pub fn api_add(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params)
     if content.is_empty() {
         return err(400, "'content' is required");
     }
+    let project = match optional_str(&body, "project") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let fields = match optional_str(&body, "memory_type") {
+        Ok(memory_type) => StructuredFields {
+            memory_type,
+            ..Default::default()
+        },
+        Err(e) => return e,
+    };
 
     let input = MemoryAddInput {
         sensitive: body
@@ -375,14 +390,26 @@ pub fn api_add(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params)
         predicate: None,
         object: None,
         entities: Vec::new(),
+        project,
         ..Default::default()
     };
-    match queries::add_memory(store, input) {
+    match queries::add_memory_with(store, input, &fields) {
         Ok(memory) => (
             201,
             Body::Json(serde_json::to_value(memory).unwrap_or(json!({}))),
         ),
+        Err(StoreError::Invalid(why)) => err(400, why),
         Err(e) => internal_err(e),
+    }
+}
+
+/// An optional string field of a JSON body: absent or `null` is `None`, any
+/// other non-string is a 400 naming the field.
+fn optional_str(body: &Value, key: &str) -> Result<Option<String>, (u16, Body)> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(err(400, format!("'{key}' must be a string"))),
     }
 }
 

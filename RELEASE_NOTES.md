@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-28 — HTTP add route takes `project` and `memory_type` (Mill Board #1632)
+
+### Added
+- `POST /api/memories` reads optional `project` and `memory_type`, as MCP `remind_me_add` does: a blank project is unset, and the kind goes through the same core validation (the enum; a `decision` needs `metadata.rationale`, a `dead_end` its fields). Omitting both behaves as before. Unblocks the Let Em Loose lessons writer (#599, bbp_factory #1414).
+- **Compatibility:** a write the core refuses as invalid (bad kind, missing rationale, an over-long project) is now a 400 with the reason, not a 500. A non-string `project` or `memory_type` is a 400.
+
+### Tests
+- Both fields are stored and read back; omitted or `null` matches today's add; a blank project is unset; an unknown kind, a decision without rationale and a non-string field are each a 400.
+
 ## 2026-11-28 — Dialog backfill dry run: generated capture ids (Mill Board #528, D146–D150)
 
 ### Changed
