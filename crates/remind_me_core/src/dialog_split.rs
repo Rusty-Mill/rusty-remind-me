@@ -168,9 +168,14 @@ pub(crate) fn split_file(import_id: &str, bytes: Option<&[u8]>, rows: &[&Memory]
         return FileOutcome::Fallback(Fallback::NotAConversationList);
     };
     let ids = conversation_ids(import_id, &conversations);
-    let texts: Vec<[String; 2]> = conversations.iter().map(haystacks).collect();
+    let texts: Vec<Vec<String>> = conversations.iter().map(haystacks).collect();
     let (mut assigned, mut unmatched, mut ambiguous) = (Vec::new(), 0, 0);
     for m in rows {
+        // An empty row is in every string: it places nothing.
+        if m.content.is_empty() {
+            unmatched += 1;
+            continue;
+        }
         let mut found = texts
             .iter()
             .enumerate()
@@ -231,19 +236,21 @@ fn conversation_ids(import_id: &str, conversations: &[serde_json::Value]) -> Vec
         .collect()
 }
 
-/// A conversation's text as the importer could have cut rows from it, raw
-/// and redacted: every message, and the whole exchange as one block.
-fn haystacks(conversation: &serde_json::Value) -> [String; 2] {
+/// Each string the importer could have cut a conversation's rows from, raw
+/// and redacted: every message in each mode, and the whole exchange as one
+/// candidate. Kept apart, as the importer chunks each one on its own, so a
+/// match can never span two of them.
+fn haystacks(conversation: &serde_json::Value) -> Vec<String> {
     let messages = extract_messages_with_tools(conversation);
-    let mut parts = filter_messages(&messages, "all_messages");
-    parts.extend(filter_messages(&messages, "conversations"));
-    parts.extend(filter_messages(&messages, ""));
-    let raw = parts.join("\n\n");
+    let raw: Vec<String> = ["all_messages", "conversations", ""]
+        .iter()
+        .flat_map(|mode| filter_messages(&messages, mode))
+        .collect();
     // Always redacted, whatever `REMIND_ME_REDACT` says now: the import may
     // have run with it on, and the target digest must not move with the
     // environment.
-    let redacted = redact(&raw).content;
-    [raw, redacted]
+    let redacted: Vec<String> = raw.iter().map(|r| redact(r).content).collect();
+    raw.into_iter().chain(redacted).collect()
 }
 
 #[cfg(test)]
@@ -387,5 +394,24 @@ mod tests {
 
         assert_eq!(assigned(&off).len(), 1);
         assert_eq!(off, on, "the environment does not change the ids");
+    }
+
+    #[test]
+    fn a_match_across_two_importer_outputs_or_an_empty_row_places_nothing() {
+        // "alpha\n\nbeta" only exists across two messages' outputs; the
+        // other conversation holds neither.
+        let bytes = export(serde_json::json!([
+            { "uuid": "u1", "chat_messages": [
+                { "sender": "human", "text": "alpha" },
+                { "sender": "assistant", "text": "beta" },
+            ]},
+            { "uuid": "u2", "chat_messages": [{ "sender": "human", "text": "gamma" }] },
+        ]));
+        let rows = [row("m1", "] alpha\n\n[assistant"), row("m2", "")];
+        let refs: Vec<&Memory> = rows.iter().collect();
+
+        let outcome = split_file("imp1", Some(&bytes), &refs);
+
+        assert_eq!(outcome, FileOutcome::Fallback(Fallback::ParseMismatch));
     }
 }
