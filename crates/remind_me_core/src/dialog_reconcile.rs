@@ -130,22 +130,31 @@ pub const MINTED_PREFIX: &str = "cap_gen_";
 pub(crate) fn mint_group(m: &Memory) -> (MintKey, String) {
     let present = |v: &Option<String>| v.as_deref().filter(|s| !s.is_empty()).map(str::to_owned);
     if let Some(session) = present(&m.session_id) {
-        return (MintKey::Session, format!("session:{}:{session}", m.source));
+        return (
+            MintKey::Session,
+            group_key(&["session", &m.source, &session]),
+        );
     }
     if let Some(doc) = present(&m.doc_id) {
-        return (MintKey::Doc, format!("doc:{doc}"));
+        return (MintKey::Doc, group_key(&["doc", &doc]));
     }
     let import = m
         .metadata
         .get("import_id")
         .and_then(serde_json::Value::as_str);
     if let Some(import) = import.filter(|s| !s.is_empty()) {
-        return (MintKey::Import, format!("import:{import}"));
+        return (MintKey::Import, group_key(&["import", import]));
     }
-    (MintKey::Row, format!("row:{}", m.id))
+    (MintKey::Row, group_key(&["row", &m.id]))
 }
 
-/// The generated `capture_id` of a row that has none (D147, D148): the same
+/// The parts of a group key as netstrings (`<byte length>:<part>,`), so
+/// no stored value, separators included, can make two groups one.
+pub(crate) fn group_key(parts: &[&str]) -> String {
+    parts.iter().map(|p| format!("{}:{p},", p.len())).collect()
+}
+
+/// The generated `capture_id` of a row that has none (D147, D148, D150): the same
 /// on every run, so the dry run's target digest binds the apply. `None`
 /// when the row has its own.
 pub(crate) fn minted_capture_id(m: &Memory) -> Option<String> {

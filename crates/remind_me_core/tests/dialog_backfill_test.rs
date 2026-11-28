@@ -207,8 +207,9 @@ fn old_imports(db: &Database) -> Vec<String> {
     rows.iter().map(|r| r.id.clone()).collect()
 }
 
-/// The generated id of a group key (D148).
-fn generated(key: &str) -> String {
+/// The generated id of a group, from its key parts as netstrings (D148).
+fn generated(parts: &[&str]) -> String {
+    let key: String = parts.iter().map(|p| format!("{}:{p},", p.len())).collect();
     format!("cap_gen_{}", &content_key(key.as_bytes())[..32])
 }
 
@@ -261,12 +262,12 @@ fn generated_ids_are_stable_and_bind_the_target_digest() {
     let planned = plan(&db.store()).unwrap();
 
     // What an apply does: each row under its generated id.
-    let keys = [
-        "session:import:s1",
-        "session:import:s1",
-        "doc:doc1",
-        "import:imp1",
-        "row:mem_lone",
+    let keys: [&[&str]; 5] = [
+        &["session", "import", "s1"],
+        &["session", "import", "s1"],
+        &["doc", "doc1"],
+        &["import", "imp1"],
+        &["row", "mem_lone"],
     ];
     let store = store_dir(&dir);
     let mut log = DialogLog::new(
@@ -332,5 +333,34 @@ fn dry_run_timing_on_a_large_store() {
         started.elapsed()
     );
     assert_eq!(report.findings(), 0);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn separators_in_source_or_session_never_merge_two_conversations() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, db) = fresh("separators");
+    let now = chrono::Utc::now().to_rfc3339();
+    // ("a:b", "c") and ("a", "b:c") would share "session:a:b:c" if joined.
+    let row = |id: &str, source: &str, session: &str| NewMemory {
+        category: "dialog".into(),
+        source: source.into(),
+        session_id: Some(session.into()),
+        ..NewMemory::new(id, format!("user: {id}"), &now)
+    };
+    {
+        let db_store = db.store();
+        let memories = Memories::new(&db_store);
+        memories.insert(&row("mem_x", "a:b", "c")).unwrap();
+        memories.insert(&row("mem_y", "a", "b:c")).unwrap();
+    }
+
+    let report = plan(&db.store()).unwrap();
+
+    assert_eq!((report.minted_rows, report.minted_capture_ids), (2, 2));
+    assert_ne!(
+        generated(&["session", "a:b", "c"]),
+        generated(&["session", "a", "b:c"])
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
