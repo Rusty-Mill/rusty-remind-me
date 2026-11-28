@@ -65,11 +65,13 @@ pub struct SplitCount {
 }
 
 /// Rows of split files that kept the file's id: found in no conversation,
-/// or in more than one.
+/// in more than one, or in a search that hit [`MAX_SPANS`] before every
+/// other conversation was ruled out.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Residual {
     pub unmatched: u64,
     pub ambiguous: u64,
+    pub unresolved: u64,
 }
 
 /// Every split decided for a set of rows.
@@ -89,8 +91,7 @@ pub(crate) enum FileOutcome {
     Split {
         /// Memory id and generated capture id, for each matched row.
         assigned: Vec<(String, String)>,
-        unmatched: u64,
-        ambiguous: u64,
+        residual: Residual,
     },
 }
 
@@ -104,7 +105,7 @@ pub fn resolve(store: &Store<'_>, rows: &[Memory]) -> Result<Splits> {
     for (import_id, members) in by_import(rows) {
         let bytes = archived_bytes(store, &import_id)
             .map_err(|e| StoreError::Engine(format!("archive of {import_id}: {e}")))?;
-        let outcome = split_file(&import_id, bytes.as_deref(), &members);
+        let outcome = split_file(&import_id, bytes.as_deref(), &members, MAX_SPANS);
         fold(&mut splits, &import_id, members.len() as u64, outcome);
     }
     Ok(splits)
@@ -143,24 +144,27 @@ fn fold(splits: &mut Splits, import_id: &str, rows: u64, outcome: FileOutcome) {
             count.rows += rows;
             count.import_ids.push(import_id.to_string());
         }
-        FileOutcome::Split {
-            assigned,
-            unmatched,
-            ambiguous,
-        } => {
+        FileOutcome::Split { assigned, residual } => {
             let conversations: BTreeSet<&String> = assigned.iter().map(|(_, id)| id).collect();
             splits.split.files += 1;
             splits.split.conversations += conversations.len() as u64;
             splits.split.rows += assigned.len() as u64;
-            splits.residual.unmatched += unmatched;
-            splits.residual.ambiguous += ambiguous;
+            splits.residual.unmatched += residual.unmatched;
+            splits.residual.ambiguous += residual.ambiguous;
+            splits.residual.unresolved += residual.unresolved;
             splits.ids.extend(assigned);
         }
     }
 }
 
-/// Split one file's rows by the conversations in its archived `bytes`.
-pub(crate) fn split_file(import_id: &str, bytes: Option<&[u8]>, rows: &[&Memory]) -> FileOutcome {
+/// Split one file's rows by the conversations in its archived `bytes`,
+/// trying at most `cap` candidate spans per importer output.
+pub(crate) fn split_file(
+    import_id: &str,
+    bytes: Option<&[u8]>,
+    rows: &[&Memory],
+    cap: usize,
+) -> FileOutcome {
     let Some(bytes) = bytes else {
         return FileOutcome::Fallback(Fallback::NoArchive);
     };
@@ -169,31 +173,66 @@ pub(crate) fn split_file(import_id: &str, bytes: Option<&[u8]>, rows: &[&Memory]
     };
     let ids = conversation_ids(import_id, &conversations);
     let texts: Vec<Vec<String>> = conversations.iter().map(haystacks).collect();
-    let (mut assigned, mut unmatched, mut ambiguous) = (Vec::new(), 0, 0);
+    let (mut assigned, mut residual) = (Vec::new(), Residual::default());
     for m in rows {
-        // An empty row is in every string: it places nothing.
-        if m.content.is_empty() {
-            unmatched += 1;
-            continue;
-        }
-        let mut found = texts
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.iter().any(|h| holds(h, &m.content)));
-        match (found.next(), found.next()) {
-            (Some((i, _)), None) => assigned.push((m.id.clone(), ids[i].clone())),
-            (None, _) => unmatched += 1,
-            (Some(_), Some(_)) => ambiguous += 1,
+        match place(&texts, &m.content, cap) {
+            Placement::One(i) => assigned.push((m.id.clone(), ids[i].clone())),
+            Placement::None => residual.unmatched += 1,
+            Placement::Many => residual.ambiguous += 1,
+            Placement::Unresolved => residual.unresolved += 1,
         }
     }
     if assigned.is_empty() {
         return FileOutcome::Fallback(Fallback::ParseMismatch);
     }
-    FileOutcome::Split {
-        assigned,
-        unmatched,
-        ambiguous,
+    FileOutcome::Split { assigned, residual }
+}
+
+/// Where one row belongs among a file's conversations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Placement {
+    /// Exactly one conversation holds it and every other is ruled out.
+    One(usize),
+    None,
+    Many,
+    /// A search hit its cap, so some conversation is neither found nor
+    /// ruled out.
+    Unresolved,
+}
+
+fn place(texts: &[Vec<String>], content: &str, cap: usize) -> Placement {
+    // An empty row is in every string: it places nothing.
+    if content.is_empty() {
+        return Placement::None;
     }
+    let (mut found, mut unknown) = (Vec::new(), false);
+    for (i, outputs) in texts.iter().enumerate() {
+        match conversation_holds(outputs, content, cap) {
+            Found::Yes => found.push(i),
+            Found::Unknown => unknown = true,
+            Found::No => {}
+        }
+    }
+    match (found.as_slice(), unknown) {
+        ([_, _, ..], _) => Placement::Many,
+        (_, true) => Placement::Unresolved,
+        ([i], false) => Placement::One(*i),
+        ([], false) => Placement::None,
+    }
+}
+
+/// A match in any output settles the conversation; otherwise an exhausted
+/// search leaves it unknown.
+fn conversation_holds(outputs: &[String], content: &str, cap: usize) -> Found {
+    let mut verdict = Found::No;
+    for output in outputs {
+        match holds(output, content, cap) {
+            Found::Yes => return Found::Yes,
+            Found::Unknown => verdict = Found::Unknown,
+            Found::No => {}
+        }
+    }
+    verdict
 }
 
 /// The conversations of a chat export, when `bytes` are one: a JSON list
@@ -249,9 +288,19 @@ fn haystacks(conversation: &serde_json::Value) -> Vec<String> {
 }
 
 /// Most candidate spans one output is tried with for one redacted row, so a
-/// short, common literal cannot make the dry run quadratic. A row that needs
-/// more stays residual, the same on every run.
+/// short, common literal cannot make the dry run quadratic. An output with
+/// more candidates is neither a match nor ruled out, and its row stays
+/// residual (`unresolved`), the same on every run.
 const MAX_SPANS: usize = 256;
+
+/// Whether one search of an importer output found the row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Found {
+    Yes,
+    No,
+    /// `cap` candidates were tried without a match and more were left.
+    Unknown,
+}
 
 /// Whether `output` holds `content`. A row with redaction markers is how
 /// the importer stored a chunk: it cut a span of the output, then redacted
@@ -262,25 +311,38 @@ const MAX_SPANS: usize = 256;
 /// and a secret across a cut redacts as the chunk did. A row that starts
 /// or ends with a marker has nothing to bound that marker's source, so it
 /// cannot be verified and places nothing.
-fn holds(output: &str, content: &str) -> bool {
+fn holds(output: &str, content: &str, cap: usize) -> Found {
     let markers = markers(content);
     let (Some(&(first_at, _)), Some(&(_, last_end))) = (markers.first(), markers.last()) else {
-        return output.contains(content);
+        return found(output.contains(content));
     };
     let (first, last) = (&content[..first_at], &content[last_end..]);
     if first.is_empty() || last.is_empty() {
-        return false;
+        return Found::No;
     }
-    output
-        .match_indices(first)
-        .flat_map(|(at, _)| {
-            let after = at + first.len();
-            output[after..]
-                .match_indices(last)
-                .map(move |(end, l)| (at, after + end + l.len()))
-        })
-        .take(MAX_SPANS)
-        .any(|(at, end)| redact(&output[at..end]).content == content)
+    let spans = output.match_indices(first).flat_map(|(at, _)| {
+        let after = at + first.len();
+        output[after..]
+            .match_indices(last)
+            .map(move |(end, l)| (at, after + end + l.len()))
+    });
+    for (tried, (at, end)) in spans.enumerate() {
+        if tried == cap {
+            return Found::Unknown;
+        }
+        if redact(&output[at..end]).content == content {
+            return Found::Yes;
+        }
+    }
+    Found::No
+}
+
+fn found(yes: bool) -> Found {
+    if yes {
+        Found::Yes
+    } else {
+        Found::No
+    }
 }
 
 /// The byte ranges of each closed `[REDACTED:<kind>]` marker in `content`.
@@ -346,7 +408,12 @@ mod tests {
         ];
         let refs: Vec<&Memory> = rows.iter().collect();
 
-        let got = assigned(&split_file("imp1", Some(&two_chats(true)), &refs));
+        let got = assigned(&split_file(
+            "imp1",
+            Some(&two_chats(true)),
+            &refs,
+            MAX_SPANS,
+        ));
 
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].1, got[1].1, "one conversation, one id");
@@ -359,8 +426,18 @@ mod tests {
         let rows = [row("m1", "ask beta")];
         let refs: Vec<&Memory> = rows.iter().collect();
 
-        let by_uuid = assigned(&split_file("imp1", Some(&two_chats(true)), &refs));
-        let by_index = assigned(&split_file("imp1", Some(&two_chats(false)), &refs));
+        let by_uuid = assigned(&split_file(
+            "imp1",
+            Some(&two_chats(true)),
+            &refs,
+            MAX_SPANS,
+        ));
+        let by_index = assigned(&split_file(
+            "imp1",
+            Some(&two_chats(false)),
+            &refs,
+            MAX_SPANS,
+        ));
         let uuid_key = group_key(&["conv", "imp1", "uuid", "u2"]);
         let index_key = group_key(&["conv", "imp1", "index", "1"]);
 
@@ -386,28 +463,37 @@ mod tests {
         ];
         let refs: Vec<&Memory> = rows.iter().collect();
 
-        let outcome = split_file("imp1", Some(&two_chats(true)), &refs);
+        let outcome = split_file("imp1", Some(&two_chats(true)), &refs, MAX_SPANS);
 
-        let FileOutcome::Split {
-            assigned,
-            unmatched,
-            ambiguous,
-        } = outcome
-        else {
+        let FileOutcome::Split { assigned, residual } = outcome else {
             panic!("expected a split");
         };
-        assert_eq!((assigned.len(), unmatched, ambiguous), (1, 1, 1));
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(
+            residual,
+            Residual {
+                unmatched: 1,
+                ambiguous: 1,
+                unresolved: 0
+            }
+        );
     }
 
     #[test]
     fn files_that_cannot_be_split_say_why() {
         let rows = [row("m1", "ask alpha")];
         let refs: Vec<&Memory> = rows.iter().collect();
-        let other =
-            |r: &[&Memory]| split_file("imp1", Some(br#"[{"role":"user","content":"hi"}]"#), r);
+        let other = |r: &[&Memory]| {
+            split_file(
+                "imp1",
+                Some(br#"[{"role":"user","content":"hi"}]"#),
+                r,
+                MAX_SPANS,
+            )
+        };
 
         assert_eq!(
-            split_file("imp1", None, &refs),
+            split_file("imp1", None, &refs, MAX_SPANS),
             FileOutcome::Fallback(Fallback::NoArchive)
         );
         assert_eq!(
@@ -417,7 +503,7 @@ mod tests {
         let stray = [row("m9", "not in the file")];
         let stray: Vec<&Memory> = stray.iter().collect();
         assert_eq!(
-            split_file("imp1", Some(&two_chats(true)), &stray),
+            split_file("imp1", Some(&two_chats(true)), &stray, MAX_SPANS),
             FileOutcome::Fallback(Fallback::ParseMismatch)
         );
     }
@@ -435,9 +521,9 @@ mod tests {
         let refs: Vec<&Memory> = rows.iter().collect();
 
         crate::test_env::set_var("REMIND_ME_REDACT", "0");
-        let off = split_file("imp1", Some(&bytes), &refs);
+        let off = split_file("imp1", Some(&bytes), &refs, MAX_SPANS);
         crate::test_env::remove_var("REMIND_ME_REDACT");
-        let on = split_file("imp1", Some(&bytes), &refs);
+        let on = split_file("imp1", Some(&bytes), &refs, MAX_SPANS);
 
         assert_eq!(assigned(&off).len(), 1);
         assert_eq!(off, on, "the environment does not change the ids");
@@ -457,7 +543,7 @@ mod tests {
         let rows = [row("m1", "] alpha\n\n[assistant"), row("m2", "")];
         let refs: Vec<&Memory> = rows.iter().collect();
 
-        let outcome = split_file("imp1", Some(&bytes), &refs);
+        let outcome = split_file("imp1", Some(&bytes), &refs, MAX_SPANS);
 
         assert_eq!(outcome, FileOutcome::Fallback(Fallback::ParseMismatch));
     }
@@ -479,41 +565,117 @@ mod tests {
         let rows = [row("m1", &chunk)];
         let refs: Vec<&Memory> = rows.iter().collect();
 
-        assert_eq!(assigned(&split_file("imp1", Some(&bytes), &refs)).len(), 1);
+        assert_eq!(
+            assigned(&split_file("imp1", Some(&bytes), &refs, MAX_SPANS)).len(),
+            1
+        );
+    }
+
+    fn yes(output: &str, content: &str) -> bool {
+        holds(output, content, MAX_SPANS) == Found::Yes
+    }
+
+    fn no(output: &str, content: &str) -> bool {
+        holds(output, content, MAX_SPANS) == Found::No
     }
 
     #[test]
     fn literals_around_markers_must_appear_in_order() {
         let card = "card [REDACTED:card_number] please";
-        assert!(holds("card 4111 1111 1111 1111 please", card));
+        assert!(yes("card 4111 1111 1111 1111 please", card));
+        assert!(no("card is not needed please", card), "the gap must redact");
+        assert!(no("please card 4111 1111 1111 1111", card));
         assert!(
-            !holds("card is not needed please", card),
-            "the gap must redact"
-        );
-        assert!(!holds("please card 4111 1111 1111 1111", card));
-        assert!(
-            !holds("card old 4111 1111 1111 1111 please", card),
+            no("card old 4111 1111 1111 1111 please", card),
             "surplus gap text"
         );
         let two = "a [REDACTED:card_number] b [REDACTED:card_number] c";
-        assert!(holds("a 4111 1111 1111 1111 b 5500 0000 0000 0004 c", two));
+        assert!(yes("a 4111 1111 1111 1111 b 5500 0000 0000 0004 c", two));
         assert!(
-            !holds("a 4111 1111 1111 1111 b c", two),
+            no("a 4111 1111 1111 1111 b c", two),
             "one card, two markers"
         );
-        assert!(!holds("anything", "[REDACTED:card_number]"));
+        assert!(no("anything", "[REDACTED:card_number]"));
         assert!(
-            !holds("x please", "[REDACTED:card_number] please"),
+            no("x please", "[REDACTED:card_number] please"),
             "unverified edge"
         );
         assert!(
-            !holds("card x", "card [REDACTED:card_number]"),
+            no("card x", "card [REDACTED:card_number]"),
             "unverified edge"
         );
-        assert!(holds("a [REDACTED:open", "a [REDACTED:open"));
+        assert!(yes("a [REDACTED:open", "a [REDACTED:open"));
         // The secret's context lives in the literal before it.
         let stored = redact("password: hunter2hunter2 please").content;
         assert!(stored.contains(REDACTED_PREFIX), "{stored}");
-        assert!(holds("said password: hunter2hunter2 please, ok", &stored));
+        assert!(yes("said password: hunter2hunter2 please, ok", &stored));
+    }
+
+    #[test]
+    fn a_search_that_tests_every_candidate_at_the_cap_is_decided() {
+        let card = "card [REDACTED:card_number] please";
+        // Three candidate spans, none of them the row.
+        let three = "card x please card y please";
+        assert_eq!(holds(three, card, 3), Found::No, "exactly at the cap");
+        assert_eq!(holds(three, card, 2), Found::Unknown, "one skipped");
+        // The third candidate is the row.
+        let last = "card x please card 4111 1111 1111 1111 please";
+        assert_eq!(holds(last, card, 3), Found::Yes);
+        assert_eq!(holds(last, card, 2), Found::Unknown);
+    }
+
+    #[test]
+    fn an_early_match_does_not_rule_out_an_exhausted_conversation() {
+        let bytes = export(serde_json::json!([
+            { "uuid": "u1", "chat_messages": [
+                { "sender": "human", "text": "card 4111 1111 1111 1111 please" },
+            ]},
+            { "uuid": "u2", "chat_messages": [
+                { "sender": "human", "text": "card x please card y please" },
+            ]},
+        ]));
+        // m2 is plain text in u2 only, so the file still splits.
+        let rows = [
+            row("m1", "card [REDACTED:card_number] please"),
+            row("m2", "card x please"),
+        ];
+        let refs: Vec<&Memory> = rows.iter().collect();
+
+        let FileOutcome::Split { assigned, residual } = split_file("imp1", Some(&bytes), &refs, 1)
+        else {
+            panic!("expected a split");
+        };
+        let full = self::assigned(&split_file("imp1", Some(&bytes), &refs, MAX_SPANS));
+
+        assert_eq!(
+            assigned
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["m2"]
+        );
+        assert_eq!(residual.unresolved, 1, "m1 keeps the file id");
+        assert_eq!(full.len(), 2, "u2 is ruled out once fully searched");
+        assert_ne!(full[0].1, full[1].1);
+    }
+
+    #[test]
+    fn a_match_settles_its_own_conversation_despite_an_exhausted_output() {
+        // u1's first message and the whole exchange exhaust the cap; its
+        // second message holds the row on the first candidate.
+        let bytes = export(serde_json::json!([
+            { "uuid": "u1", "chat_messages": [
+                { "sender": "human", "text": "card x please card y please" },
+                { "sender": "assistant", "text": "card 4111 1111 1111 1111 please" },
+            ]},
+            { "uuid": "u2", "chat_messages": [{ "sender": "human", "text": "other" }] },
+        ]));
+        let rows = [row("m1", "card [REDACTED:card_number] please")];
+        let refs: Vec<&Memory> = rows.iter().collect();
+
+        assert_eq!(
+            assigned(&split_file("imp1", Some(&bytes), &refs, 1)).len(),
+            1
+        );
     }
 }
