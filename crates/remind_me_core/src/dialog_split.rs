@@ -248,89 +248,55 @@ fn haystacks(conversation: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// Whether `output` holds `content`. A redaction marker stands for text the
-/// raw output still has: the importer redacts each chunk after cutting, so
-/// a secret across a cut leaves a marker no whole-message redaction makes.
-/// The literal text around the markers must then appear in order, and the
-/// source text between two literals must redact to exactly the markers it
-/// replaced, in order, with nothing left over. A row that starts or ends
-/// with a marker has nothing to bound that marker's source, so it cannot be
-/// verified and places nothing. Matching runs only the pure redaction
-/// rules, never the env switch, so `REMIND_ME_REDACT` cannot move the ids.
+/// Most candidate spans one output is tried with for one redacted row, so a
+/// short, common literal cannot make the dry run quadratic. A row that needs
+/// more stays residual, the same on every run.
+const MAX_SPANS: usize = 256;
+
+/// Whether `output` holds `content`. A row with redaction markers is how
+/// the importer stored a chunk: it cut a span of the output, then redacted
+/// that span on its own. So it matches when some span of `output` that
+/// starts with the row's first literal and ends with its last redacts
+/// (pure rules, never the env switch) to exactly the row. The span keeps
+/// each secret's own context (`password:` before it, the URL around it),
+/// and a secret across a cut redacts as the chunk did. A row that starts
+/// or ends with a marker has nothing to bound that marker's source, so it
+/// cannot be verified and places nothing.
 fn holds(output: &str, content: &str) -> bool {
-    if !content.contains(REDACTED_PREFIX) {
+    let markers = markers(content);
+    let (Some(&(first_at, _)), Some(&(_, last_end))) = (markers.first(), markers.last()) else {
         return output.contains(content);
-    }
-    let pieces = pieces(content);
-    let edge_marker = |p: Option<&Piece<'_>>| p.is_some_and(|p| p.text.is_empty());
-    if edge_marker(pieces.first()) || edge_marker(pieces.last()) {
-        return false;
-    }
-    let literals: Vec<usize> = (0..pieces.len())
-        .filter(|&i| !pieces[i].text.is_empty())
-        .collect();
-    let Some(&first) = literals.first() else {
-        return false;
     };
+    let (first, last) = (&content[..first_at], &content[last_end..]);
+    if first.is_empty() || last.is_empty() {
+        return false;
+    }
     output
-        .match_indices(pieces[first].text)
-        .any(|(at, l)| follows(output, at + l.len(), &pieces, &literals[1..], first))
-}
-
-/// Whether the literals in `rest` can be placed after byte `from` of
-/// `output`, each gap redacting to the kinds of the markers it replaced.
-fn follows(output: &str, from: usize, pieces: &[Piece<'_>], rest: &[usize], prev: usize) -> bool {
-    let Some((&next, tail)) = rest.split_first() else {
-        return true;
-    };
-    let kinds: Vec<&str> = pieces[prev + 1..=next]
-        .iter()
-        .flat_map(|p| p.kinds_before.iter().copied())
-        .collect();
-    output[from..]
-        .match_indices(pieces[next].text)
-        .map(|(at, l)| (from + at, l.len()))
-        .any(|(at, len)| {
-            redacts_to(&output[from..at], &kinds) && follows(output, at + len, pieces, tail, next)
+        .match_indices(first)
+        .flat_map(|(at, _)| {
+            let after = at + first.len();
+            output[after..]
+                .match_indices(last)
+                .map(move |(end, l)| (at, after + end + l.len()))
         })
+        .take(MAX_SPANS)
+        .any(|(at, end)| redact(&output[at..end]).content == content)
 }
 
-/// Whether `gap` redacts to exactly the markers of `kinds`, in order.
-fn redacts_to(gap: &str, kinds: &[&str]) -> bool {
-    let markers: String = kinds
-        .iter()
-        .map(|k| format!("{REDACTED_PREFIX}{k}]"))
-        .collect();
-    redact(gap).content == markers
-}
-
-/// A run of literal text and the kinds of the markers just before it.
-struct Piece<'a> {
-    kinds_before: Vec<&'a str>,
-    text: &'a str,
-}
-
-/// `content` cut at each `[REDACTED:<kind>]` marker.
-fn pieces(content: &str) -> Vec<Piece<'_>> {
+/// The byte ranges of each closed `[REDACTED:<kind>]` marker in `content`.
+/// An unclosed one is literal text.
+fn markers(content: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
-    let mut kinds = Vec::new();
-    let mut rest = content;
-    while let Some(start) = rest.find(REDACTED_PREFIX) {
-        let tail = &rest[start + REDACTED_PREFIX.len()..];
-        let Some(end) = tail.find(']') else {
-            break; // An unclosed marker is literal text.
+    let mut from = 0;
+    while let Some(at) = content[from..].find(REDACTED_PREFIX) {
+        let start = from + at;
+        let Some(close) = content[start..].find(']') else {
+            break;
         };
-        out.push(Piece {
-            kinds_before: std::mem::take(&mut kinds),
-            text: &rest[..start],
-        });
-        kinds.push(&tail[..end]);
-        rest = &tail[end + 1..];
+        let end = start + close + 1;
+        out.push((start, end));
+        from = end;
     }
-    out.push(Piece {
-        kinds_before: kinds,
-        text: rest,
-    });
     out
 }
 
@@ -545,5 +511,9 @@ mod tests {
             "unverified edge"
         );
         assert!(holds("a [REDACTED:open", "a [REDACTED:open"));
+        // The secret's context lives in the literal before it.
+        let stored = redact("password: hunter2hunter2 please").content;
+        assert!(stored.contains(REDACTED_PREFIX), "{stored}");
+        assert!(holds("said password: hunter2hunter2 please, ok", &stored));
     }
 }
