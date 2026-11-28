@@ -364,3 +364,96 @@ fn separators_in_source_or_session_never_merge_two_conversations() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A July-style import: one archived chat export holding two
+/// conversations, its rows carrying only `metadata.import_id` (D152).
+fn archived_export(db: &Database, dir: &Path, import_id: &str, archive: bool) {
+    let export = serde_json::json!([
+        { "uuid": "c1", "chat_messages": [
+            { "sender": "human", "text": "how do tides work" },
+            { "sender": "assistant", "text": "the moon pulls the sea" },
+        ]},
+        { "uuid": "c2", "chat_messages": [
+            { "sender": "human", "text": "best bread flour" },
+        ]},
+    ]);
+    if archive {
+        let bytes = serde_json::to_vec(&export).unwrap();
+        test_env::set_var(
+            remind_me_core::archive::ARCHIVE_DIR_ENV,
+            dir.join("archive"),
+        );
+        remind_me_core::archive::store(
+            &db.store(),
+            import_id,
+            "conversations.json",
+            &content_key(&bytes),
+            &bytes,
+        )
+        .unwrap()
+        .unwrap();
+        test_env::remove_var(remind_me_core::archive::ARCHIVE_DIR_ENV);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let db_store = db.store();
+    let memories = Memories::new(&db_store);
+    for (id, text) in [
+        ("mem_t1", "how do tides work"),
+        ("mem_t2", "the moon pulls the sea"),
+        ("mem_b1", "best bread flour"),
+        ("mem_x1", "said nowhere in the file"),
+    ] {
+        memories
+            .insert(&NewMemory {
+                category: "dialog".into(),
+                source: "import".into(),
+                metadata: serde_json::json!({ "import_id": import_id }),
+                ..NewMemory::new(id, text, &now)
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn an_archived_export_moves_under_one_id_per_conversation() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, db) = fresh("split");
+    archived_export(&db, &dir, "imp_split", true);
+
+    let report = plan(&db.store()).unwrap();
+
+    let conv = &report.minted_by_key["conversation"];
+    assert_eq!((conv.groups, conv.rows), (2, 3));
+    assert_eq!(
+        report.minted_by_key["import"].rows, 1,
+        "the stray row keeps the file id"
+    );
+    assert_eq!(
+        (
+            report.conversation_split.files,
+            report.conversation_split.conversations
+        ),
+        (1, 2)
+    );
+    assert_eq!(report.residual_rows.unmatched, 1);
+    assert_eq!((report.would_append, report.findings()), (4, 0));
+    let again = plan(&db.store()).unwrap();
+    assert_eq!(again.target_digest, report.target_digest, "stable ids");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn an_export_with_no_archive_keeps_one_id_and_says_so() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, db) = fresh("noarchive");
+    archived_export(&db, &dir, "imp_gone", false);
+
+    let report = plan(&db.store()).unwrap();
+
+    let fallback = &report.conversation_fallback["no_archive"];
+    assert_eq!((fallback.files, fallback.rows), (1, 4));
+    assert_eq!(fallback.import_ids, ["imp_gone"]);
+    assert_eq!(report.minted_by_key["import"].groups, 1);
+    assert!(!report.minted_by_key.contains_key("conversation"));
+    let _ = std::fs::remove_dir_all(dir);
+}
