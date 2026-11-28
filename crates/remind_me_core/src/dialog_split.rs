@@ -320,11 +320,9 @@ fn holds(output: &str, content: &str, cap: usize) -> Found {
     if first.is_empty() || last.is_empty() {
         return Found::No;
     }
-    let spans = output.match_indices(first).flat_map(|(at, _)| {
+    let spans = occurrences(output, first).flat_map(|at| {
         let after = at + first.len();
-        output[after..]
-            .match_indices(last)
-            .map(move |(end, l)| (at, after + end + l.len()))
+        occurrences(&output[after..], last).map(move |end| (at, after + end + last.len()))
     });
     for (tried, (at, end)) in spans.enumerate() {
         if tried == cap {
@@ -335,6 +333,18 @@ fn holds(output: &str, content: &str, cap: usize) -> Found {
         }
     }
     Found::No
+}
+
+/// Every start of `needle` in `hay`, overlapping ones included: a chunk can
+/// begin inside a run such as `:::`, which `match_indices` would skip.
+fn occurrences<'a>(hay: &'a str, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        let at = from + hay.get(from..)?.find(needle)?;
+        let step = hay[at..].chars().next().map_or(1, char::len_utf8);
+        from = at + step;
+        Some(at)
+    })
 }
 
 fn found(yes: bool) -> Found {
@@ -609,6 +619,19 @@ mod tests {
         let stored = redact("password: hunter2hunter2 please").content;
         assert!(stored.contains(REDACTED_PREFIX), "{stored}");
         assert!(yes("said password: hunter2hunter2 please, ok", &stored));
+    }
+
+    #[test]
+    fn overlapping_literals_are_each_a_candidate_start_and_end() {
+        let card = "4111 1111 1111 1111";
+        let row = redact(&format!("::{card} please")).content;
+        assert!(row.starts_with("::["), "{row}");
+        assert!(yes(&format!(":::{card} please"), &row), "start inside :::");
+        let tail = redact(&format!("see {card} ..")).content;
+        assert!(tail.ends_with("] .."), "{tail}");
+        assert!(yes(&format!("see {card} ..."), &tail), "end inside ...");
+        assert_eq!(occurrences("aaa", "aa").collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(occurrences("éé", "é").collect::<Vec<_>>(), [0, 2]);
     }
 
     #[test]
