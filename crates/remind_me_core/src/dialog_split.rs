@@ -252,16 +252,20 @@ fn haystacks(conversation: &serde_json::Value) -> Vec<String> {
 /// raw output still has: the importer redacts each chunk after cutting, so
 /// a secret across a cut leaves a marker no whole-message redaction makes.
 /// The literal text around the markers must then appear in order, and the
-/// source text between two literals must itself redact to those markers'
-/// kinds. A marker at either edge of the row has no neighbour to bound it,
-/// since the cut may have split its secret, and is not checked. Matching
-/// runs only the pure redaction rules, never the env switch, so
-/// `REMIND_ME_REDACT` cannot move the ids.
+/// source text between two literals must redact to exactly the markers it
+/// replaced, in order, with nothing left over. A row that starts or ends
+/// with a marker has nothing to bound that marker's source, so it cannot be
+/// verified and places nothing. Matching runs only the pure redaction
+/// rules, never the env switch, so `REMIND_ME_REDACT` cannot move the ids.
 fn holds(output: &str, content: &str) -> bool {
     if !content.contains(REDACTED_PREFIX) {
         return output.contains(content);
     }
     let pieces = pieces(content);
+    let edge_marker = |p: Option<&Piece<'_>>| p.is_some_and(|p| p.text.is_empty());
+    if edge_marker(pieces.first()) || edge_marker(pieces.last()) {
+        return false;
+    }
     let literals: Vec<usize> = (0..pieces.len())
         .filter(|&i| !pieces[i].text.is_empty())
         .collect();
@@ -291,15 +295,13 @@ fn follows(output: &str, from: usize, pieces: &[Piece<'_>], rest: &[usize], prev
         })
 }
 
-/// Whether `gap` holds a secret of every kind in `kinds`.
+/// Whether `gap` redacts to exactly the markers of `kinds`, in order.
 fn redacts_to(gap: &str, kinds: &[&str]) -> bool {
-    if kinds.is_empty() {
-        return gap.is_empty();
-    }
-    let redacted = redact(gap).content;
-    kinds
+    let markers: String = kinds
         .iter()
-        .all(|k| redacted.contains(&format!("{REDACTED_PREFIX}{k}]")))
+        .map(|k| format!("{REDACTED_PREFIX}{k}]"))
+        .collect();
+    redact(gap).content == markers
 }
 
 /// A run of literal text and the kinds of the markers just before it.
@@ -523,7 +525,25 @@ mod tests {
             "the gap must redact"
         );
         assert!(!holds("please card 4111 1111 1111 1111", card));
+        assert!(
+            !holds("card old 4111 1111 1111 1111 please", card),
+            "surplus gap text"
+        );
+        let two = "a [REDACTED:card_number] b [REDACTED:card_number] c";
+        assert!(holds("a 4111 1111 1111 1111 b 5500 0000 0000 0004 c", two));
+        assert!(
+            !holds("a 4111 1111 1111 1111 b c", two),
+            "one card, two markers"
+        );
         assert!(!holds("anything", "[REDACTED:card_number]"));
+        assert!(
+            !holds("x please", "[REDACTED:card_number] please"),
+            "unverified edge"
+        );
+        assert!(
+            !holds("card x", "card [REDACTED:card_number]"),
+            "unverified edge"
+        );
         assert!(holds("a [REDACTED:open", "a [REDACTED:open"));
     }
 }
