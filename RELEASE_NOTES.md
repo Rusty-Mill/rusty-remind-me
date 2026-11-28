@@ -2,6 +2,24 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-27 — Dialog backfill dry run (Mill Board #528, D144, D145)
+
+### Added
+- `dialog_backfill::plan`: a read-only dry run of copying every live `memories` dialog row into the dialog store. It writes nothing; with no store, none is created. The report gives:
+  - live rows and how many are sensitive;
+  - `would_append` (count and body bytes);
+  - `already_present` (same id, same D77 canonical hash);
+  - `drift` (same id, other hash: the apply would refuse these);
+  - `no_capture_id` (rows that cannot be stored, listed but not a finding; Q38);
+  - the store-side problems D132 lists (blob missing or wrong size, no live memory);
+  - `store_digest` and `target_digest`: sha256 over the sorted canonical hashes of the store now and of the store an apply would reach. The later apply must finish on the approved target.
+- `rusty-remind-me dialogs backfill` runs only in an already-running daemon, as the other `dialogs` verbs do. It prints the report as JSON and exits 1 on findings. `--apply` is refused: it is not built and waits for Nano's go after the counts (D144, D3).
+- `docs/handoff`: D144 (Nano: build it, dry run only), D145 (this slice and the planned apply) and Q38.
+
+### Tests
+- No store: every row would append and no store is created. A partly shadowed store is counted, and its file and blobs are byte-identical after the run. The target digest equals the store reached by appending the planned rows. Drift, orphans and missing blobs are findings. A dialog with no capture id is listed. CLI parsing refuses `--apply`.
+- Cost: 12,500 dialog rows (25,000 memories), half already in the store, took 0.22 s in a release build, and peak RSS from just before the run was 176 MB, which includes what the test process already held. Rerun with `cargo test --release -p remind_me_core --test dialog_backfill_test -- --ignored --nocapture`.
+
 ## 2026-11-27 — Dialog rebuild check (Mill Board #528, D133)
 
 ### Added

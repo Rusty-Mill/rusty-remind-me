@@ -9,6 +9,7 @@ mod session;
 use daemon::Store;
 use remind_me_api::ApiServer;
 use remind_me_core::daemon::ops::{Op, TopicAction};
+use remind_me_core::dialog_backfill::Report as BackfillReport;
 use remind_me_core::dialog_rebuild::Report as RebuildReport;
 use remind_me_core::dialog_reconcile::Report as DialogReport;
 use remind_me_core::entity::Entity;
@@ -1848,6 +1849,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("{}", serde_json::to_string_pretty(&report)?);
                         report.findings()
                     }
+                    DialogsVerb::Backfill => {
+                        let report: BackfillReport = daemon_plan(&mut store, Op::DialogsBackfill)?;
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        report.findings()
+                    }
                     DialogsVerb::RebuildCheck { scratch, keep } => {
                         // The daemon may run elsewhere: give it an absolute path.
                         let scratch = scratch.map(std::path::absolute).transpose()?;
@@ -1872,13 +1878,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 const DIALOGS_USAGE: &str = "usage: rusty-remind-me dialogs check [--full] | \
-                             dialogs rebuild-check [--scratch DIR] [--keep]";
+                             dialogs rebuild-check [--scratch DIR] [--keep] | \
+                             dialogs backfill";
+
+/// Why `dialogs backfill --apply` is refused.
+const APPLY_NOT_BUILT: &str =
+    "dialogs backfill --apply: not built: waits for Nano's go after the counts (D144, D3)";
 
 /// A `dialogs` subcommand.
 #[derive(Debug, PartialEq, Eq)]
 enum DialogsVerb {
     /// `check [--full]`: `full` re-hashes every blob.
     Check { full: bool },
+    /// `backfill`: the dry run; there is no apply yet.
+    Backfill,
     /// `rebuild-check [--scratch DIR] [--keep]`.
     RebuildCheck {
         scratch: Option<PathBuf>,
@@ -1893,6 +1906,8 @@ fn parse_dialogs_args(args: &[String]) -> Result<DialogsVerb, String> {
         ("check", []) => Ok(DialogsVerb::Check { full: false }),
         ("check", [full]) if full == "--full" => Ok(DialogsVerb::Check { full: true }),
         ("rebuild-check", _) => parse_rebuild_flags(rest).ok_or_else(usage),
+        ("backfill", []) => Ok(DialogsVerb::Backfill),
+        ("backfill", [apply]) if apply == "--apply" => Err(APPLY_NOT_BUILT.to_string()),
         _ => Err(usage()),
     }
 }
@@ -1947,6 +1962,19 @@ mod tests {
         assert!(parse_dialogs_args(&args(&[])).is_err());
         assert!(parse_dialogs_args(&args(&["check", "--fast"])).is_err());
         assert!(parse_dialogs_args(&args(&["repair"])).is_err());
+    }
+
+    #[test]
+    fn dialogs_backfill_is_a_dry_run_and_refuses_apply() {
+        assert_eq!(
+            parse_dialogs_args(&args(&["backfill"])),
+            Ok(DialogsVerb::Backfill)
+        );
+        assert_eq!(
+            parse_dialogs_args(&args(&["backfill", "--apply"])),
+            Err(APPLY_NOT_BUILT.to_string())
+        );
+        assert!(parse_dialogs_args(&args(&["backfill", "--dry-run"])).is_err());
     }
 
     #[test]

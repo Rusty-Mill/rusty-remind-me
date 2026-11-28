@@ -1,0 +1,227 @@
+//! The dialog backfill dry run (#528, D144, D145): counts what would move,
+//! writes nothing.
+
+#[path = "../src/test_env.rs"]
+mod test_env;
+
+use remind_me_core::blobs::BlobStore;
+use remind_me_core::capture::auto_capture;
+use remind_me_core::db::dialogs::{dir_beside, DialogLog, DialogStore, NewDialog};
+use remind_me_core::db::memories::{Memories, NewMemory};
+use remind_me_core::db::sqlite::SqliteDialogs;
+use remind_me_core::dialog_backfill::plan;
+use remind_me_core::dialog_shadow::{record_memory, ENV};
+use remind_me_core::{AutoCaptureInput, Database};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// The shadow flag is process-global.
+static LOCK: Mutex<()> = Mutex::new(());
+
+fn input(text: &str) -> AutoCaptureInput {
+    AutoCaptureInput {
+        conversation: format!("user: {text}\nassistant: noted"),
+        summary: format!("About {text}."),
+        title: String::new(),
+        tags: vec![],
+        category: "conversation".into(),
+        metadata: serde_json::json!({}),
+        project: None,
+    }
+}
+
+fn fresh(name: &str) -> (PathBuf, Database) {
+    let dir = std::env::temp_dir().join(format!(
+        "rrm_backfill_{name}_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Database::open(dir.join("remind_me.db")).unwrap();
+    (dir, db)
+}
+
+fn capture(db: &Database, text: &str, shadow: bool) -> String {
+    if shadow {
+        test_env::set_var(ENV, "1");
+    }
+    let made = auto_capture(&db.store(), &input(text));
+    test_env::remove_var(ENV);
+    made.unwrap().dialog_id
+}
+
+fn store_dir(dir: &Path) -> PathBuf {
+    dir_beside(&dir.join("remind_me.db")).unwrap()
+}
+
+/// Every file under `root` with its bytes, sorted by path. SQLite's own
+/// `-wal` and `-shm` side files are left out: opening the store read only
+/// may create or fold them without changing a row.
+fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.to_string_lossy();
+            if path.is_dir() {
+                stack.push(path);
+            } else if !(name.ends_with("-wal") || name.ends_with("-shm")) {
+                let bytes = std::fs::read(&path).unwrap();
+                out.push((path, bytes));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn with_no_store_every_row_would_append_and_nothing_is_created() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, db) = fresh("none");
+    capture(&db, "alpha", false);
+    capture(&db, "beta", false);
+
+    let report = plan(&db.store()).unwrap();
+
+    assert_eq!((report.live, report.would_append), (2, 2));
+    assert!(report.would_append_bytes > 0);
+    assert_eq!((report.store_rows, report.target_rows), (0, 2));
+    assert_eq!(report.findings(), 0, "{report:?}");
+    assert!(
+        !store_dir(&dir).exists(),
+        "the dry run never creates a store"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_partly_shadowed_store_is_counted_and_left_byte_identical() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, db) = fresh("partial");
+    capture(&db, "alpha", true);
+    capture(&db, "beta", false);
+    let before = snapshot(&store_dir(&dir));
+
+    let report = plan(&db.store()).unwrap();
+
+    assert_eq!(report.already_present, 1);
+    assert_eq!(report.would_append, 1);
+    assert_eq!((report.store_rows, report.target_rows), (1, 2));
+    assert_eq!(report.findings(), 0, "{report:?}");
+    assert_eq!(snapshot(&store_dir(&dir)), before, "nothing is written");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_target_digest_is_the_store_an_apply_would_reach() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, db) = fresh("digest");
+    capture(&db, "alpha", true);
+    let beta = capture(&db, "beta", false);
+    let planned = plan(&db.store()).unwrap();
+    assert_ne!(planned.store_digest, planned.target_digest);
+
+    // What an apply does for the one missing row.
+    let row = Memories::new(&db.store()).get_live(&beta).unwrap().unwrap();
+    test_env::set_var(ENV, "1");
+    record_memory(&db.store(), &row);
+    test_env::remove_var(ENV);
+
+    let after = plan(&db.store()).unwrap();
+    assert_eq!(after.would_append, 0);
+    assert_eq!(after.store_rows, planned.target_rows);
+    assert_eq!(after.store_digest, planned.target_digest);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn drift_orphans_and_bad_blobs_are_findings() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, db) = fresh("problems");
+    let missing = capture(&db, "alpha", true);
+    let drifted = capture(&db, "beta", false);
+    let store = store_dir(&dir);
+    let mut log = DialogLog::new(
+        SqliteDialogs::open(&store).unwrap(),
+        BlobStore::new(store.join("blobs")),
+    );
+    for (id, body) in [(drifted.as_str(), "other text"), ("mem_orphan", "nobody's")] {
+        log.record(&NewDialog {
+            id,
+            capture_id: "cap_x",
+            session_id: None,
+            project: None,
+            created_at: "2026-11-27T00:00:00Z",
+            body,
+        })
+        .unwrap();
+    }
+    let row = log.store().get(&missing).unwrap().unwrap();
+    std::fs::remove_file(BlobStore::new(store.join("blobs")).path(&row.body_hash)).unwrap();
+
+    let report = plan(&db.store()).unwrap();
+
+    assert_eq!(report.drift, [drifted]);
+    assert_eq!(report.no_memory, ["mem_orphan"]);
+    assert_eq!(report.blob_missing, [missing]);
+    assert_eq!(report.would_append, 0);
+    assert_eq!(report.findings(), 3);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_dialog_with_no_capture_id_is_listed_not_a_finding() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, db) = fresh("nocap");
+    let now = chrono::Utc::now().to_rfc3339();
+    let row = NewMemory {
+        category: "dialog".into(),
+        ..NewMemory::new("mem_imported", "user: an old import", &now)
+    };
+    Memories::new(&db.store()).insert(&row).unwrap();
+
+    let report = plan(&db.store()).unwrap();
+
+    assert_eq!(report.no_capture_id, ["mem_imported"]);
+    assert_eq!(report.would_append, 0);
+    assert_eq!(report.findings(), 0);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The PR's cost figure: a 25k-memory store, half its dialogs shadowed. Run
+/// by hand with
+/// `cargo test --release --test dialog_backfill_test -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn dry_run_timing_on_a_large_store() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, db) = fresh("timing");
+    for i in 0..12_500 {
+        capture(
+            &db,
+            &format!("topic {i} {}", "word ".repeat(80)),
+            i % 2 == 0,
+        );
+    }
+    // Linux: reset the peak resident size, so it measures the dry run only.
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
+    let started = std::time::Instant::now();
+    let report = plan(&db.store()).unwrap();
+    let peak = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmHWM"))
+                .map(str::to_string)
+        });
+    println!(
+        "dry run: {} live, {} would append, {} present in {:?}; {peak:?}",
+        report.live,
+        report.would_append,
+        report.already_present,
+        started.elapsed()
+    );
+    assert_eq!(report.findings(), 0);
+    let _ = std::fs::remove_dir_all(dir);
+}
